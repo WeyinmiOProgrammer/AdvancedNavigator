@@ -1,0 +1,161 @@
+"""Focused tests for the city navigator's routing and time calculations."""
+
+import unittest
+from datetime import datetime
+from pathlib import Path
+from tempfile import TemporaryDirectory
+from xml.etree import ElementTree
+
+from app import CityMap, Pathway, Preferences, TravelMode, render_svg
+
+
+class CityMapTests(unittest.TestCase):
+    """Verify graph construction, mode rules, and time-dependent travel."""
+
+    def setUp(self) -> None:
+        """Build a fresh synthetic city for each independent test."""
+        self.city = CityMap()
+
+    def test_map_has_named_fixed_locations_and_station_only_train_edges(self) -> None:
+        """The map is stable and all rail segments join designated stations."""
+        self.assertGreaterEqual(len(self.city.locations), 20)
+        self.assertEqual(self.city.locations["Central Station"].x, 43)
+        for edges in self.city.adjacency.values():
+            for edge in edges:
+                if edge.pathway is Pathway.TRAIN:
+                    self.assertTrue(self.city.locations[edge.start].is_station)
+                    self.assertTrue(self.city.locations[edge.end].is_station)
+
+    def test_walking_and_driving_respect_pathway_restrictions(self) -> None:
+        """Walkers avoid roads and rail while drivers stay on roads."""
+        when = datetime(2026, 6, 15, 10, 0)
+        walk_routes = self.city.find_routes(
+            "Old Town", "Central Station", when, TravelMode.WALKING, limit=3
+        )
+        drive_routes = self.city.find_routes(
+            "Old Town", "Central Station", when, TravelMode.DRIVING, limit=3
+        )
+        self.assertTrue(walk_routes)
+        self.assertTrue(drive_routes)
+        self.assertTrue(
+            all(leg.edge.pathway is Pathway.PAVEMENT for leg in walk_routes[0].legs)
+        )
+        self.assertTrue(
+            all(leg.edge.pathway is Pathway.ROAD for leg in drive_routes[0].legs)
+        )
+        self.assertTrue(
+            all(
+                not leg.edge.highway
+                for leg in self.city.find_routes(
+                    "Old Town",
+                    "Airport Station",
+                    when,
+                    TravelMode.WALKING,
+                    limit=3,
+                )[0].legs
+            )
+        )
+
+    def test_transit_route_combines_walk_and_train_edges(self) -> None:
+        """A transit trip can walk to a station, ride, and walk to its destination."""
+        routes = self.city.find_routes(
+            "Old Town",
+            "Airport Village",
+            datetime(2026, 6, 15, 8, 7),
+            TravelMode.TRANSIT,
+            limit=3,
+        )
+        self.assertTrue(routes)
+        pathway_types = {leg.edge.pathway for leg in routes[0].legs}
+        self.assertIn(Pathway.TRAIN, pathway_types)
+        self.assertIn(Pathway.PAVEMENT, pathway_types)
+        self.assertNotIn(Pathway.ROAD, pathway_types)
+
+    def test_train_departures_and_weekday_rush_hour_change_timing(self) -> None:
+        """Train times round up to service intervals and weekday traffic is slower."""
+        self.assertEqual(
+            self.city.next_train_departure(datetime(2026, 6, 15, 8, 7)),
+            datetime(2026, 6, 15, 8, 15),
+        )
+        self.assertEqual(
+            self.city.next_train_departure(datetime(2026, 6, 15, 8, 15, 1)),
+            datetime(2026, 6, 15, 8, 30),
+        )
+        self.assertEqual(
+            self.city.next_train_departure(datetime(2026, 6, 15, 23, 0)),
+            datetime(2026, 6, 16, 6, 0),
+        )
+        road = next(
+            edge
+            for edge in self.city.adjacency["Old Town"]
+            if edge.end == "Market Square" and edge.pathway is Pathway.ROAD
+        )
+        rush = self.city._leg_for(road, datetime(2026, 6, 15, 8, 0))
+        midday = self.city._leg_for(road, datetime(2026, 6, 15, 12, 0))
+        self.assertGreater(rush.arrival - rush.departure, midday.arrival - midday.departure)
+
+    def test_route_duration_includes_initial_train_wait(self) -> None:
+        """A trip starting at a station counts the wait before its first train."""
+        requested = datetime(2026, 6, 15, 8, 7)
+        routes = self.city.find_routes(
+            "Central Station",
+            "Riverside Station",
+            requested,
+            TravelMode.TRANSIT,
+            limit=1,
+        )
+        self.assertTrue(routes)
+        route = routes[0]
+        self.assertEqual(route.departure, requested)
+        self.assertGreater(route.legs[0].departure, requested)
+        self.assertEqual(route.duration, route.arrival - requested)
+
+    def test_arrival_deadline_returns_routes_that_arrive_on_time(self) -> None:
+        """Arrival-time planning finds a feasible departure before its deadline."""
+        deadline = datetime(2026, 6, 15, 9, 0)
+        routes = self.city.routes_arriving_by(
+            "Old Town",
+            "Central Station",
+            deadline,
+            TravelMode.TRANSIT,
+            Preferences(),
+        )
+        self.assertTrue(routes)
+        self.assertTrue(all(route.arrival <= deadline for route in routes))
+        self.assertTrue(all(route.departure <= route.arrival for route in routes))
+
+    def test_toll_preference_excludes_toll_edges(self) -> None:
+        """An avoid-tolls preference is enforced during route expansion."""
+        routes = self.city.find_routes(
+            "Harbor Station",
+            "Airport Station",
+            datetime(2026, 6, 15, 12, 0),
+            TravelMode.DRIVING,
+            Preferences(avoid_tolls=True),
+            limit=3,
+        )
+        self.assertTrue(routes)
+        self.assertTrue(
+            all(not leg.edge.toll for route in routes for leg in route.legs)
+        )
+
+    def test_selected_route_renders_as_valid_standalone_svg(self) -> None:
+        """The map output is valid SVG and includes the route-highlight styling."""
+        route = self.city.find_routes(
+            "Old Town",
+            "Central Station",
+            datetime(2026, 6, 15, 10, 0),
+            TravelMode.WALKING,
+            limit=1,
+        )[0]
+        with TemporaryDirectory() as temporary_directory:
+            output = render_svg(
+                self.city, route, Path(temporary_directory) / "route.svg"
+            )
+            root = ElementTree.parse(output).getroot()
+            self.assertTrue(root.tag.endswith("svg"))
+            self.assertIn("#d62828", output.read_text(encoding="utf-8"))
+
+
+if __name__ == "__main__":
+    unittest.main()
