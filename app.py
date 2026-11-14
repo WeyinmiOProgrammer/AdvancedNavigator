@@ -90,6 +90,37 @@ class Leg:
 
 
 @dataclass(frozen=True)
+class Obstruction:
+    """A scheduled or injected condition affecting selected graph pathways."""
+
+    start: str
+    end: str
+    pathway: Pathway
+    name: str
+    reason: str
+    modes: tuple[TravelMode, ...]
+    blocked: bool
+    speed_factor: float
+    weekdays: tuple[int, ...] = ()
+    start_minute: int = 0
+    end_minute: int = 24 * 60
+
+    def is_active(self, edge: Edge, at: datetime, mode: TravelMode) -> bool:
+        """Match an edge in either direction and its scheduled local-time window."""
+        if (
+            edge.pathway is not self.pathway
+            or {edge.start, edge.end} != {self.start, self.end}
+            or mode not in self.modes
+        ):
+            return False
+        minute = at.hour * 60 + at.minute
+        return (
+            (not self.weekdays or at.weekday() in self.weekdays)
+            and self.start_minute <= minute < self.end_minute
+        )
+
+
+@dataclass(frozen=True)
 class Route:
     """A complete path and its timed traversals."""
 
@@ -134,6 +165,47 @@ class CityMap:
     TRAIN_FIRST_MINUTE = 6 * 60
     TRAIN_LAST_MINUTE = 22 * 60 + 45
     TRAIN_INTERVAL_MINUTES = 15
+    SCHEDULED_OBSTRUCTIONS = (
+        Obstruction(
+            "Central Station",
+            "University",
+            Pathway.ROAD,
+            "College Road",
+            "Planned roadworks",
+            (TravelMode.DRIVING,),
+            True,
+            1.0,
+            (0, 1, 2, 3, 4),
+            9 * 60,
+            16 * 60,
+        ),
+        Obstruction(
+            "West End",
+            "City Hospital",
+            Pathway.ROAD,
+            "Medical Boulevard",
+            "Weekday rush-hour traffic",
+            (TravelMode.DRIVING,),
+            False,
+            2.2,
+            (0, 1, 2, 3, 4),
+            7 * 60,
+            9 * 60,
+        ),
+        Obstruction(
+            "Botanical Gardens",
+            "Hilltop",
+            Pathway.PAVEMENT,
+            "Botanical Trail",
+            "Severe-weather trail closure",
+            (TravelMode.WALKING, TravelMode.TRANSIT),
+            True,
+            1.0,
+            (5, 6),
+            9 * 60,
+            18 * 60,
+        ),
+    )
 
     def __init__(self) -> None:
         """Create the locations, pathways, and bidirectional adjacency list."""
@@ -325,17 +397,31 @@ class CityMap:
             7 <= at.hour < 9 or 16 <= at.hour < 18
         )
 
-    def _leg_for(self, edge: Edge, at: datetime) -> Leg:
+    def _leg_for(
+        self,
+        edge: Edge,
+        at: datetime,
+        mode: Optional[TravelMode] = None,
+        obstructions: tuple[Obstruction, ...] = (),
+    ) -> Leg:
         """Calculate an edge's travel and waiting time at the supplied instant."""
+        speed_factor = 1.0
+        if mode is not None:
+            for obstruction in (*self.SCHEDULED_OBSTRUCTIONS, *obstructions):
+                if obstruction.is_active(edge, at, mode) and not obstruction.blocked:
+                    speed_factor *= obstruction.speed_factor
         if edge.pathway is Pathway.TRAIN:
             departure = self.next_train_departure(at)
-            duration = timedelta(hours=edge.distance_km / edge.speed_limit_kmh)
+            duration = timedelta(
+                hours=edge.distance_km / edge.speed_limit_kmh * speed_factor
+            )
             return Leg(edge, departure, departure + duration)
 
         departure = at
         hours = edge.distance_km / edge.speed_limit_kmh
         if edge.pathway is Pathway.ROAD and self._is_rush_hour(at):
             hours *= 1.6
+        hours *= speed_factor
         duration = timedelta(hours=hours)
         return Leg(edge, departure, departure + duration)
 
@@ -365,6 +451,7 @@ class CityMap:
         mode: TravelMode = TravelMode.TRANSIT,
         preferences: Preferences = Preferences(),
         limit: int = 3,
+        obstructions: tuple[Obstruction, ...] = (),
     ) -> list[Route]:
         """Find up to ``limit`` distinct, simple routes ordered by user priority."""
         if start not in self.locations or destination not in self.locations:
@@ -406,7 +493,13 @@ class CityMap:
                     continue
                 if not self._preference_allows(edge, preferences):
                     continue
-                leg = self._leg_for(edge, current_time)
+                if any(
+                    obstruction.is_active(edge, current_time, mode)
+                    and obstruction.blocked
+                    for obstruction in (*self.SCHEDULED_OBSTRUCTIONS, *obstructions)
+                ):
+                    continue
+                leg = self._leg_for(edge, current_time, mode, obstructions)
                 updated_legs = legs + (leg,)
                 updated_path = path + (edge.end,)
                 updated_elapsed = (leg.arrival - departure).total_seconds() / 60
@@ -437,6 +530,7 @@ class CityMap:
         mode: TravelMode,
         preferences: Preferences,
         limit: int = 3,
+        obstructions: tuple[Obstruction, ...] = (),
     ) -> list[Route]:
         """Find route templates and estimate each one's latest feasible departure.
 
@@ -446,7 +540,13 @@ class CityMap:
         """
         window_start = deadline - timedelta(days=1)
         candidates = self.find_routes(
-            start, destination, window_start, mode, preferences, limit=max(limit * 4, limit)
+            start,
+            destination,
+            window_start,
+            mode,
+            preferences,
+            limit=max(limit * 4, limit),
+            obstructions=obstructions,
         )
         feasible: list[Route] = []
         for candidate in candidates:
@@ -455,7 +555,14 @@ class CityMap:
             while low <= high:
                 minutes = (low + high) // 2
                 candidate_departure = window_start + timedelta(minutes=minutes)
-                route = self._time_fixed_path(candidate.locations, candidate.legs, candidate_departure, mode, preferences)
+                route = self._time_fixed_path(
+                    candidate.locations,
+                    candidate.legs,
+                    candidate_departure,
+                    mode,
+                    preferences,
+                    obstructions,
+                )
                 if route is not None and route.arrival <= deadline:
                     best = route
                     low = minutes + 1
@@ -476,6 +583,7 @@ class CityMap:
         departure: datetime,
         mode: TravelMode,
         preferences: Preferences,
+        obstructions: tuple[Obstruction, ...] = (),
     ) -> Optional[Route]:
         """Re-time a known sequence of locations and reject now-invalid links."""
         timed_legs: list[Leg] = []
@@ -493,9 +601,14 @@ class CityMap:
                 edge is None
                 or not self._mode_allows(edge, mode)
                 or not self._preference_allows(edge, preferences)
+                or any(
+                    obstruction.is_active(edge, current_time, mode)
+                    and obstruction.blocked
+                    for obstruction in (*self.SCHEDULED_OBSTRUCTIONS, *obstructions)
+                )
             ):
                 return None
-            leg = self._leg_for(edge, current_time)
+            leg = self._leg_for(edge, current_time, mode, obstructions)
             timed_legs.append(leg)
             current_time = leg.arrival
         return Route(locations, tuple(timed_legs), departure)
@@ -661,6 +774,32 @@ class TripRequest(BaseModel):
     limit: int = Field(default=3, ge=1, le=3)
 
 
+class IncidentRequest(BaseModel):
+    """One user-injected disruption on a pathway in the city graph."""
+
+    start: str = Field(min_length=1, max_length=100)
+    end: str = Field(min_length=1, max_length=100)
+    pathway: Literal["road", "pavement", "train"]
+    kind: Literal["block", "delay"]
+
+
+class RerouteRequest(BaseModel):
+    """Current journey position and the incident that requires a new route."""
+
+    destination: str = Field(min_length=1, max_length=100)
+    time: datetime
+    mode: Literal["driving", "walking", "transit"]
+    current_edge_start: str
+    current_edge_end: str
+    current_edge_pathway: Literal["road", "pavement", "train"]
+    progress: float = Field(ge=0, le=1)
+    incident: IncidentRequest
+    additional_incidents: list[IncidentRequest] = Field(default_factory=list)
+    avoid_tolls: bool = False
+    avoid_highways: bool = False
+    priority: Literal["fastest", "shortest"] = "fastest"
+
+
 class LocationResponse(BaseModel):
     """A fixed graph node returned for dynamic browser map rendering."""
 
@@ -687,6 +826,23 @@ class CityResponse(BaseModel):
 
     locations: list[LocationResponse]
     pathways: list[PathwayResponse]
+    obstructions: list["ScheduledObstructionResponse"]
+
+
+class ScheduledObstructionResponse(BaseModel):
+    """A scheduled condition and the local-time window used by the map."""
+
+    start: str
+    end: str
+    pathway: str
+    name: str
+    reason: str
+    modes: list[str]
+    blocked: bool
+    speed_factor: float
+    weekdays: list[int]
+    start_minute: int
+    end_minute: int
 
 
 class RouteLegResponse(BaseModel):
@@ -718,6 +874,20 @@ class RoutesResponse(BaseModel):
     """Response envelope shared by all successful route requests."""
 
     routes: list[RouteResponse]
+
+
+class RerouteResponse(BaseModel):
+    """The new path and the mode-specific movement needed to reach it."""
+
+    switch_node: str
+    approach_minutes: float
+    reaction_minutes: float
+    approach_start_x: float
+    approach_start_y: float
+    approach_end_x: float
+    approach_end_y: float
+    reason: str
+    route: RouteResponse
 
 
 app = FastAPI(title="City Navigator", version="1.0.0")
@@ -764,7 +934,48 @@ def get_city() -> CityResponse:
                     train_line=edge.train_line,
                 )
             )
-    return CityResponse(locations=locations, pathways=pathways)
+    obstructions = [
+        ScheduledObstructionResponse(
+            start=obstruction.start,
+            end=obstruction.end,
+            pathway=obstruction.pathway.value,
+            name=obstruction.name,
+            reason=obstruction.reason,
+            modes=[mode.name.lower() for mode in obstruction.modes],
+            blocked=obstruction.blocked,
+            speed_factor=obstruction.speed_factor,
+            weekdays=list(obstruction.weekdays),
+            start_minute=obstruction.start_minute,
+            end_minute=obstruction.end_minute,
+        )
+        for obstruction in city.SCHEDULED_OBSTRUCTIONS
+    ]
+    return CityResponse(locations=locations, pathways=pathways, obstructions=obstructions)
+
+
+def _route_response(route: Route, route_id: int) -> RouteResponse:
+    """Adapt one simulator route to its stable browser representation."""
+    return RouteResponse(
+        id=route_id,
+        locations=list(route.locations),
+        legs=[
+            RouteLegResponse(
+                start=leg.edge.start,
+                end=leg.edge.end,
+                pathway=leg.edge.pathway.value,
+                name=leg.edge.name,
+                train_line=leg.edge.train_line,
+                departure=leg.departure,
+                arrival=leg.arrival,
+            )
+            for leg in route.legs
+        ],
+        departure=route.departure,
+        arrival=route.arrival,
+        duration_minutes=math.ceil(route.duration.total_seconds() / 60),
+        distance_km=route.distance_km,
+        summary=route.summary(),
+    )
 
 
 @app.post("/api/routes", response_model=RoutesResponse)
@@ -804,29 +1015,177 @@ def calculate_routes(request: TripRequest) -> RoutesResponse:
     # identify and highlight the matching lines without another server request.
     return RoutesResponse(
         routes=[
-            RouteResponse(
-                id=index,
-                locations=list(route.locations),
-                legs=[
-                    RouteLegResponse(
-                        start=leg.edge.start,
-                        end=leg.edge.end,
-                        pathway=leg.edge.pathway.value,
-                        name=leg.edge.name,
-                        train_line=leg.edge.train_line,
-                        departure=leg.departure,
-                        arrival=leg.arrival,
-                    )
-                    for leg in route.legs
-                ],
-                departure=route.departure,
-                arrival=route.arrival,
-                duration_minutes=math.ceil(route.duration.total_seconds() / 60),
-                distance_km=route.distance_km,
-                summary=route.summary(),
-            )
+            _route_response(route, index)
             for index, route in enumerate(routes, start=1)
         ]
+    )
+
+
+@app.post("/api/reroute", response_model=RerouteResponse)
+def calculate_reroute(request: RerouteRequest) -> RerouteResponse:
+    """Replan around a live incident, honoring each mode's transition policy."""
+    try:
+        destination = match_location(request.destination, city)
+        edge = next(
+            item
+            for item in city.adjacency[request.current_edge_start]
+            if item.end == request.current_edge_end
+            and item.pathway.value == request.current_edge_pathway
+        )
+    except (KeyError, StopIteration, ValueError) as error:
+        raise HTTPException(
+            status_code=422, detail="The current or obstructed pathway is unknown."
+        ) from error
+
+    mode = {
+        "driving": TravelMode.DRIVING,
+        "walking": TravelMode.WALKING,
+        "transit": TravelMode.TRANSIT,
+    }[request.mode]
+    if not city._mode_allows(edge, mode):
+        raise HTTPException(
+            status_code=422,
+            detail="The current pathway is not valid for this travel mode.",
+        )
+    obstructions: list[Obstruction] = []
+    try:
+        for item in (request.incident, *request.additional_incidents):
+            incident_edge = next(
+                edge_item
+                for edge_item in city.adjacency[item.start]
+                if edge_item.end == item.end
+                and edge_item.pathway.value == item.pathway
+            )
+            obstruction_key = (
+                incident_edge.start,
+                incident_edge.end,
+                incident_edge.pathway,
+            )
+            if any(
+                (existing.start, existing.end, existing.pathway) == obstruction_key
+                or (existing.end, existing.start, existing.pathway) == obstruction_key
+                for existing in obstructions
+            ):
+                continue
+            obstructions.append(
+                Obstruction(
+                    incident_edge.start,
+                    incident_edge.end,
+                    incident_edge.pathway,
+                    incident_edge.name,
+                    "Injected blockage" if item.kind == "block" else "Injected delay",
+                    (mode,),
+                    item.kind == "block",
+                    3.0,
+                )
+            )
+    except (KeyError, StopIteration) as error:
+        raise HTTPException(
+            status_code=422, detail="The obstructed pathway is unknown."
+        ) from error
+    incident = obstructions[0]
+    preferences = Preferences(
+        avoid_tolls=request.avoid_tolls,
+        avoid_highways=request.avoid_highways,
+        priority=request.priority,
+    )
+    current_location = city.locations[edge.start]
+    next_location = city.locations[edge.end]
+    progress = request.progress
+    current_x = current_location.x + (next_location.x - current_location.x) * progress
+    current_y = current_location.y + (next_location.y - current_location.y) * progress
+
+    if mode is TravelMode.WALKING:
+        # Walkers can reverse from their exact position. If the current edge is
+        # blocked ahead, only the already-traversed side is a valid escape.
+        endpoints = (
+            [(edge.start, progress)]
+            if any(
+                obstruction.blocked
+                and obstruction.is_active(edge, request.time, mode)
+                for obstruction in obstructions
+            )
+            else [(edge.start, progress), (edge.end, 1 - progress)]
+        )
+        reaction_minutes = 0.0
+    elif progress <= 0:
+        # If playback is waiting at a node, no partial edge traversal is needed.
+        endpoints = [(edge.start, 0.0)]
+        reaction_minutes = 3.0 if mode is TravelMode.DRIVING else 0.0
+    else:
+        # Vehicles and transit remain on their fixed edge and only switch at its
+        # next node; drivers additionally spend three simulated minutes reacting.
+        endpoints = [(edge.end, 1 - progress)]
+        reaction_minutes = 3.0 if mode is TravelMode.DRIVING else 0.0
+
+    candidates: list[tuple[Route, str, float]] = []
+    for switch_node, distance_fraction in endpoints:
+        if mode is TravelMode.WALKING:
+            access_seconds = (
+                edge.distance_km
+                * distance_fraction
+                / edge.speed_limit_kmh
+                * 3600
+            )
+            for obstruction in obstructions:
+                if obstruction.is_active(edge, request.time, mode) and not obstruction.blocked:
+                    access_seconds *= obstruction.speed_factor
+            approach_minutes = access_seconds / 60
+        else:
+            # Transit follows its current fixed edge; cars also account for the
+            # live road-speed conditions before their fixed-node transition.
+            if mode is TravelMode.DRIVING:
+                current_leg = city._leg_for(edge, request.time, mode, tuple(obstructions))
+                edge_minutes = (
+                    current_leg.arrival - current_leg.departure
+                ).total_seconds() / 60
+            else:
+                incident_speed_factor = (
+                    math.prod(
+                        obstruction.speed_factor
+                        for obstruction in obstructions
+                        if obstruction.is_active(edge, request.time, mode)
+                        and not obstruction.blocked
+                    )
+                )
+                edge_minutes = (
+                    edge.distance_km / edge.speed_limit_kmh * 60
+                    * incident_speed_factor
+                )
+            approach_minutes = edge_minutes * distance_fraction
+        switch_time = request.time + timedelta(
+            minutes=approach_minutes + reaction_minutes
+        )
+        routes = city.find_routes(
+            switch_node,
+            destination,
+            switch_time,
+            mode,
+            preferences,
+            limit=1,
+            obstructions=tuple(obstructions),
+        )
+        if routes:
+            candidates.append((routes[0], switch_node, approach_minutes))
+    if not candidates:
+        raise HTTPException(
+            status_code=422,
+            detail="No route is available around that obstruction.",
+        )
+    route, switch_node, approach_minutes = min(
+        candidates, key=lambda candidate: candidate[0].arrival
+    )
+    switch_location = city.locations[switch_node]
+    return RerouteResponse(
+        switch_node=switch_node,
+        approach_minutes=approach_minutes,
+        reaction_minutes=reaction_minutes,
+        approach_start_x=current_x,
+        approach_start_y=current_y,
+        approach_end_x=switch_location.x,
+        approach_end_y=switch_location.y,
+        reason=incident.reason,
+        route=_route_response(route, 1),
     )
 
 

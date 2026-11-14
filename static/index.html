@@ -92,6 +92,7 @@
           <li><span class="legend-line pavement" aria-hidden="true"></span>Pavements</li>
           <li><span class="legend-line train" aria-hidden="true"></span>Train lines</li>
           <li><span class="legend-line selected" aria-hidden="true"></span>Selected route</li>
+          <li><span class="legend-warning" aria-hidden="true">!</span>Scheduled disruption</li>
         </ul>
       </div>
       <div class="map-frame">
@@ -100,9 +101,44 @@
           <title>City pathway map</title>
           <desc>Choose a route to highlight its path between locations.</desc>
           <g id="pathways"></g>
+          <g id="map-obstructions"></g>
           <g id="selected-route"></g>
           <g id="map-locations"></g>
+          <g id="simulation-marker"></g>
         </svg>
+      </div>
+    </section>
+
+    <section id="simulation-panel" class="simulation-panel" aria-labelledby="simulation-heading" hidden>
+      <h2 id="simulation-heading">Journey simulation</h2>
+      <button id="start-simulation" class="primary-button" type="button">Start Journey Simulation</button>
+      <div class="playback-controls" role="group" aria-label="Journey playback controls">
+        <button id="play-pause" type="button" disabled>Play</button>
+        <button id="reset-simulation" type="button" disabled>Reset</button>
+        <label for="simulation-speed">Simulation speed</label>
+        <select id="simulation-speed" disabled>
+          <option value="1">1x</option>
+          <option value="5">5x</option>
+          <option value="10">10x</option>
+        </select>
+      </div>
+      <p class="simulation-readout">
+        <span>Simulated time: <time id="simulation-clock">Not started</time></span>
+        <span>Estimated arrival: <time id="simulation-eta">Not available</time></span>
+      </p>
+    </section>
+
+    <section id="testing-panel" class="testing-panel" aria-labelledby="testing-heading" hidden>
+      <h2 id="testing-heading">Simulation Testing Panel</h2>
+      <p>Inject a disruption ahead of the moving marker to test live rerouting.</p>
+      <div class="testing-controls">
+        <button id="random-incident" type="button" disabled>Trigger random incident ahead</button>
+        <div class="field">
+          <label for="incident-pathway">Specific pathway</label>
+          <select id="incident-pathway" disabled></select>
+        </div>
+        <button id="trigger-blockage" type="button" disabled>Trigger Blockage</button>
+        <button id="trigger-delay" type="button" disabled>Trigger Delay</button>
       </div>
     </section>
 

@@ -10,11 +10,14 @@ from fastapi import HTTPException
 
 from app import (
     CityMap,
+    IncidentRequest,
     Pathway,
     Preferences,
+    RerouteRequest,
     TravelMode,
     TripRequest,
     calculate_routes,
+    calculate_reroute,
     get_city,
     render_svg,
 )
@@ -105,6 +108,26 @@ class CityMapTests(unittest.TestCase):
         midday = self.city._leg_for(road, datetime(2026, 6, 15, 12, 0))
         self.assertGreater(rush.arrival - rush.departure, midday.arrival - midday.departure)
 
+    def test_scheduled_weekday_delay_changes_the_initial_route(self) -> None:
+        """A scheduled rush-hour penalty makes a faster detour preferable."""
+        rush_route = self.city.find_routes(
+            "West End",
+            "City Hospital",
+            datetime(2026, 6, 15, 8, 0),
+            TravelMode.DRIVING,
+            limit=1,
+        )[0]
+        midday_route = self.city.find_routes(
+            "West End",
+            "City Hospital",
+            datetime(2026, 6, 15, 12, 0),
+            TravelMode.DRIVING,
+            limit=1,
+        )[0]
+        self.assertNotEqual(rush_route.locations, midday_route.locations)
+        self.assertIn("Medical Boulevard", midday_route.summary())
+        self.assertNotIn("Medical Boulevard", rush_route.summary())
+
     def test_route_duration_includes_initial_train_wait(self) -> None:
         """A trip starting at a station counts the wait before its first train."""
         requested = datetime(2026, 6, 15, 8, 7)
@@ -190,6 +213,112 @@ class WebApiTests(unittest.TestCase):
         self.assertEqual(
             {path.pathway for path in response.pathways},
             {"road", "pavement", "train"},
+        )
+        self.assertTrue(response.obstructions)
+
+    def test_mid_journey_blockage_uses_mode_specific_transition_rules(self) -> None:
+        """Walking reverses at its exact point; transit and cars reach the next node."""
+        cases = (
+            ("walking", "Old Town", "Market Square", "pavement", "Central Station",
+             "Old Town", 0.0),
+            ("driving", "Old Town", "Market Square", "road", "Central Station",
+             "Market Square", 3.0),
+            ("transit", "Central Station", "Riverside Station", "train", "Airport Station",
+             "Riverside Station", 0.0),
+        )
+        for mode, edge_start, edge_end, pathway, destination, switch_node, reaction in cases:
+            with self.subTest(mode=mode):
+                result = calculate_reroute(
+                    RerouteRequest(
+                        destination=destination,
+                        time=datetime(2026, 6, 15, 10, 0),
+                        mode=mode,
+                        current_edge_start=edge_start,
+                        current_edge_end=edge_end,
+                        current_edge_pathway=pathway,
+                        progress=0.4,
+                        incident=IncidentRequest(
+                            start=edge_start,
+                            end=edge_end,
+                            pathway=pathway,
+                            kind="block",
+                        ),
+                    )
+                )
+                self.assertEqual(result.switch_node, switch_node)
+                self.assertEqual(result.reaction_minutes, reaction)
+                self.assertEqual(result.route.locations[0], switch_node)
+                self.assertTrue(
+                    all(
+                        not (
+                            leg.start == edge_start
+                            and leg.end == edge_end
+                            and leg.pathway == pathway
+                        )
+                        for leg in result.route.legs
+                    )
+                )
+        walking = calculate_reroute(
+            RerouteRequest(
+                destination="Central Station",
+                time=datetime(2026, 6, 15, 10, 0),
+                mode="walking",
+                current_edge_start="Old Town",
+                current_edge_end="Market Square",
+                current_edge_pathway="pavement",
+                progress=0.4,
+                incident=IncidentRequest(
+                    start="Old Town",
+                    end="Market Square",
+                    pathway="pavement",
+                    kind="block",
+                ),
+            )
+        )
+        self.assertAlmostEqual(
+            walking.approach_start_x,
+            20.0,
+        )
+
+    def test_reroute_keeps_previously_injected_blockages_active(self) -> None:
+        """A later detour avoids both the new incident and earlier live incidents."""
+        result = calculate_reroute(
+            RerouteRequest(
+                destination="Central Station",
+                time=datetime(2026, 6, 15, 12, 0),
+                mode="driving",
+                current_edge_start="Old Town",
+                current_edge_end="Market Square",
+                current_edge_pathway="road",
+                progress=0.4,
+                incident=IncidentRequest(
+                    start="Old Town",
+                    end="Market Square",
+                    pathway="road",
+                    kind="block",
+                ),
+                additional_incidents=[
+                    IncidentRequest(
+                        start="Market Square",
+                        end="Central Station",
+                        pathway="road",
+                        kind="block",
+                    )
+                ],
+            )
+        )
+        self.assertTrue(
+            all(
+                not (
+                    {leg.start, leg.end}
+                    in (
+                        {"Old Town", "Market Square"},
+                        {"Market Square", "Central Station"},
+                    )
+                    and leg.pathway == "road"
+                )
+                for leg in result.route.legs
+            )
         )
 
     def test_route_response_includes_timing_and_map_segments(self) -> None:
