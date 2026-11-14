@@ -1,8 +1,9 @@
 """A small, self-contained, multimodal city-navigation simulator.
 
-Run ``python app.py`` for the interactive console application, or
-``python -m unittest -v`` to run the automated tests in ``test_app.py``.
-The map is synthetic and uses only Python's standard library.
+Run ``python -m uvicorn app:app --reload`` for the web application, or
+``python app.py`` for the interactive console application. Install the web
+dependencies first with ``python -m pip install -r requirements.txt``.
+Run ``python -m unittest -v`` to run the automated tests in ``test_app.py``.
 """
 
 from __future__ import annotations
@@ -16,7 +17,12 @@ from dataclasses import dataclass
 from datetime import datetime, timedelta
 from enum import Enum
 from pathlib import Path
-from typing import Optional
+from typing import Literal, Optional
+
+from fastapi import FastAPI, HTTPException
+from fastapi.responses import FileResponse
+from fastapi.staticfiles import StaticFiles
+from pydantic import BaseModel, Field
 
 
 # ---------------------------------------------------------------------------
@@ -634,6 +640,194 @@ def render_svg(city: CityMap, route: Route, output: Path = Path("city_route_map.
     lines.append("</svg>")
     output.write_text("\n".join(lines), encoding="utf-8")
     return output
+
+
+# ---------------------------------------------------------------------------
+# Web API
+# ---------------------------------------------------------------------------
+
+
+class TripRequest(BaseModel):
+    """Validated JSON contract accepted by the browser's route form."""
+
+    start: str = Field(min_length=1, max_length=100)
+    destination: str = Field(min_length=1, max_length=100)
+    time_kind: Literal["departure", "arrival"] = "departure"
+    time: datetime
+    mode: Literal["driving", "walking", "transit"] = "transit"
+    avoid_tolls: bool = False
+    avoid_highways: bool = False
+    priority: Literal["fastest", "shortest"] = "fastest"
+    limit: int = Field(default=3, ge=1, le=3)
+
+
+class LocationResponse(BaseModel):
+    """A fixed graph node returned for dynamic browser map rendering."""
+
+    name: str
+    x: float
+    y: float
+    is_station: bool
+
+
+class PathwayResponse(BaseModel):
+    """One undirected pathway, with the information used by the map legend."""
+
+    start: str
+    end: str
+    pathway: str
+    name: str
+    highway: bool
+    toll: bool
+    train_line: Optional[str]
+
+
+class CityResponse(BaseModel):
+    """Graph payload consumed by the frontend to draw the city map."""
+
+    locations: list[LocationResponse]
+    pathways: list[PathwayResponse]
+
+
+class RouteLegResponse(BaseModel):
+    """One timed segment; its endpoints let the browser highlight the route."""
+
+    start: str
+    end: str
+    pathway: str
+    name: str
+    train_line: Optional[str]
+    departure: datetime
+    arrival: datetime
+
+
+class RouteResponse(BaseModel):
+    """A browser-ready route option with summary, timing, and map segments."""
+
+    id: int
+    locations: list[str]
+    legs: list[RouteLegResponse]
+    departure: datetime
+    arrival: datetime
+    duration_minutes: int
+    distance_km: float
+    summary: str
+
+
+class RoutesResponse(BaseModel):
+    """Response envelope shared by all successful route requests."""
+
+    routes: list[RouteResponse]
+
+
+app = FastAPI(title="City Navigator", version="1.0.0")
+city = CityMap()
+static_directory = Path(__file__).resolve().parent / "static"
+app.mount("/static", StaticFiles(directory=static_directory), name="static")
+
+
+@app.get("/", include_in_schema=False)
+def home() -> FileResponse:
+    """Serve the browser entry point from the same process as the API."""
+    return FileResponse(static_directory / "index.html")
+
+
+@app.get("/api/city", response_model=CityResponse)
+def get_city() -> CityResponse:
+    """Expose coordinates and a de-duplicated network for the SVG map."""
+    locations = [
+        LocationResponse(
+            name=location.name,
+            x=location.x,
+            y=location.y,
+            is_station=location.is_station,
+        )
+        for location in city.locations.values()
+    ]
+    pathways: list[PathwayResponse] = []
+    seen: set[tuple[str, str, str, str]] = set()
+    for edges in city.adjacency.values():
+        for edge in edges:
+            endpoints = tuple(sorted((edge.start, edge.end)))
+            key = (endpoints[0], endpoints[1], edge.pathway.value, edge.name)
+            if key in seen:
+                continue
+            seen.add(key)
+            pathways.append(
+                PathwayResponse(
+                    start=edge.start,
+                    end=edge.end,
+                    pathway=edge.pathway.value,
+                    name=edge.name,
+                    highway=edge.highway,
+                    toll=edge.toll,
+                    train_line=edge.train_line,
+                )
+            )
+    return CityResponse(locations=locations, pathways=pathways)
+
+
+@app.post("/api/routes", response_model=RoutesResponse)
+def calculate_routes(request: TripRequest) -> RoutesResponse:
+    """Validate form locations and adapt simulator routes to the JSON contract."""
+    try:
+        start = match_location(request.start, city)
+        destination = match_location(request.destination, city)
+    except ValueError as error:
+        raise HTTPException(status_code=422, detail=str(error)) from error
+
+    mode = {
+        "driving": TravelMode.DRIVING,
+        "walking": TravelMode.WALKING,
+        "transit": TravelMode.TRANSIT,
+    }[request.mode]
+    preferences = Preferences(
+        avoid_tolls=request.avoid_tolls,
+        avoid_highways=request.avoid_highways,
+        priority=request.priority,
+    )
+    if request.time_kind == "arrival":
+        routes = city.routes_arriving_by(
+            start, destination, request.time, mode, preferences, limit=request.limit
+        )
+    else:
+        routes = city.find_routes(
+            start, destination, request.time, mode, preferences, limit=request.limit
+        )
+    if not routes:
+        raise HTTPException(
+            status_code=422,
+            detail="No route is available for those locations and trip settings.",
+        )
+
+    # Each response leg preserves its graph endpoints, so the selected card can
+    # identify and highlight the matching lines without another server request.
+    return RoutesResponse(
+        routes=[
+            RouteResponse(
+                id=index,
+                locations=list(route.locations),
+                legs=[
+                    RouteLegResponse(
+                        start=leg.edge.start,
+                        end=leg.edge.end,
+                        pathway=leg.edge.pathway.value,
+                        name=leg.edge.name,
+                        train_line=leg.edge.train_line,
+                        departure=leg.departure,
+                        arrival=leg.arrival,
+                    )
+                    for leg in route.legs
+                ],
+                departure=route.departure,
+                arrival=route.arrival,
+                duration_minutes=math.ceil(route.duration.total_seconds() / 60),
+                distance_km=route.distance_km,
+                summary=route.summary(),
+            )
+            for index, route in enumerate(routes, start=1)
+        ]
+    )
 
 
 def _ask_location(prompt: str, city: CityMap) -> str:

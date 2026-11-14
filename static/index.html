@@ -1,0 +1,119 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <meta name="theme-color" content="#12305a">
+  <title>City Navigator</title>
+  <link rel="stylesheet" href="/static/styles.css">
+  <script src="/static/app.js" defer></script>
+</head>
+<body>
+  <header class="site-header">
+    <div class="page-width">
+      <p class="eyebrow">A multimodal city guide</p>
+      <h1>City Navigator</h1>
+      <p>Plan a trip across the city's roads, walking paths, and rail network.</p>
+    </div>
+  </header>
+
+  <main class="page-width">
+    <section class="trip-panel" aria-labelledby="trip-heading">
+      <h2 id="trip-heading">Plan your trip</h2>
+      <form id="trip-form">
+        <div class="location-fields">
+          <div class="field">
+            <label for="start">Starting location</label>
+            <input id="start" name="start" list="location-options" autocomplete="off"
+                   placeholder="For example, Old Town" required>
+          </div>
+          <div class="field">
+            <label for="destination">Destination</label>
+            <input id="destination" name="destination" list="location-options" autocomplete="off"
+                   placeholder="For example, University" required>
+          </div>
+          <datalist id="location-options"></datalist>
+        </div>
+
+        <div class="settings-grid">
+          <div class="field">
+            <label for="time-kind">Plan around</label>
+            <select id="time-kind" name="time_kind">
+              <option value="departure">Departure time</option>
+              <option value="arrival">Arrival deadline</option>
+            </select>
+          </div>
+          <div class="field">
+            <label id="time-label" for="trip-time">Departure date and time</label>
+            <input id="trip-time" name="time" type="datetime-local" required>
+          </div>
+          <div class="field">
+            <label for="mode">Mode of transport</label>
+            <select id="mode" name="mode">
+              <option value="transit">Public transit</option>
+              <option value="driving">Driving</option>
+              <option value="walking">Walking</option>
+            </select>
+          </div>
+          <div class="field">
+            <label for="priority">Route preference</label>
+            <select id="priority" name="priority">
+              <option value="fastest">Fastest</option>
+              <option value="shortest">Shortest</option>
+            </select>
+          </div>
+        </div>
+
+        <fieldset class="preference-fields">
+          <legend>Optional road preferences</legend>
+          <label class="check-control" for="avoid-tolls">
+            <input id="avoid-tolls" name="avoid_tolls" type="checkbox">
+            <span>Avoid toll roads</span>
+          </label>
+          <label class="check-control" for="avoid-highways">
+            <input id="avoid-highways" name="avoid_highways" type="checkbox">
+            <span>Avoid highways</span>
+          </label>
+        </fieldset>
+
+        <button class="primary-button" type="submit">Find routes</button>
+      </form>
+      <div id="alert" class="alert" role="status" aria-live="polite" hidden></div>
+    </section>
+
+    <section class="map-section" aria-labelledby="map-heading">
+      <div class="section-heading">
+        <div>
+          <h2 id="map-heading">City map</h2>
+          <p>Select a route option to highlight its path.</p>
+        </div>
+        <ul class="legend" aria-label="Map legend">
+          <li><span class="legend-line road" aria-hidden="true"></span>Roads</li>
+          <li><span class="legend-line pavement" aria-hidden="true"></span>Pavements</li>
+          <li><span class="legend-line train" aria-hidden="true"></span>Train lines</li>
+          <li><span class="legend-line selected" aria-hidden="true"></span>Selected route</li>
+        </ul>
+      </div>
+      <div class="map-frame">
+        <svg id="city-map" viewBox="0 0 1000 850" role="img"
+             aria-label="Map of city locations and roads, pavements, and train lines">
+          <title>City pathway map</title>
+          <desc>Choose a route to highlight its path between locations.</desc>
+          <g id="pathways"></g>
+          <g id="selected-route"></g>
+          <g id="map-locations"></g>
+        </svg>
+      </div>
+    </section>
+
+    <section class="routes-section" aria-labelledby="routes-heading">
+      <h2 id="routes-heading">Route options</h2>
+      <p id="route-hint">Your available routes will appear here.</p>
+      <div id="route-list" class="route-list"></div>
+    </section>
+  </main>
+  <footer class="page-width">
+    <p>Illustrative routes in a simulated city network.</p>
+  </footer>
+</body>
+</html>

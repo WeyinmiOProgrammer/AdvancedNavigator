@@ -6,7 +6,18 @@ from pathlib import Path
 from tempfile import TemporaryDirectory
 from xml.etree import ElementTree
 
-from app import CityMap, Pathway, Preferences, TravelMode, render_svg
+from fastapi import HTTPException
+
+from app import (
+    CityMap,
+    Pathway,
+    Preferences,
+    TravelMode,
+    TripRequest,
+    calculate_routes,
+    get_city,
+    render_svg,
+)
 
 
 class CityMapTests(unittest.TestCase):
@@ -155,6 +166,73 @@ class CityMapTests(unittest.TestCase):
             root = ElementTree.parse(output).getroot()
             self.assertTrue(root.tag.endswith("svg"))
             self.assertIn("#d62828", output.read_text(encoding="utf-8"))
+
+
+class WebApiTests(unittest.TestCase):
+    """Verify that the browser API adapts the existing simulator correctly."""
+
+    def test_city_response_contains_fixed_nodes_and_each_pathway_once(self) -> None:
+        response = get_city()
+        self.assertEqual(len(response.locations), 24)
+        self.assertEqual(
+            next(
+                location.x
+                for location in response.locations
+                if location.name == "Central Station"
+            ),
+            43,
+        )
+        endpoint_types = [
+            (path.start, path.end, path.pathway, path.name)
+            for path in response.pathways
+        ]
+        self.assertEqual(len(endpoint_types), len(set(endpoint_types)))
+        self.assertEqual(
+            {path.pathway for path in response.pathways},
+            {"road", "pavement", "train"},
+        )
+
+    def test_route_response_includes_timing_and_map_segments(self) -> None:
+        response = calculate_routes(
+            TripRequest(
+                start="old town",
+                destination="Central Station",
+                time_kind="departure",
+                time=datetime(2026, 6, 15, 10, 0),
+                mode="walking",
+            )
+        )
+        self.assertTrue(response.routes)
+        route = response.routes[0]
+        self.assertEqual(route.locations[0], "Old Town")
+        self.assertEqual(route.locations[-1], "Central Station")
+        self.assertGreater(route.duration_minutes, 0)
+        self.assertTrue(route.legs)
+        self.assertTrue(all(leg.pathway == "pavement" for leg in route.legs))
+
+    def test_transit_request_uses_the_simulator_public_transit_mode(self) -> None:
+        response = calculate_routes(
+            TripRequest(
+                start="Old Town",
+                destination="Airport Village",
+                time=datetime(2026, 6, 15, 8, 7),
+                mode="transit",
+            )
+        )
+        self.assertTrue(response.routes)
+        self.assertIn("train", {leg.pathway for leg in response.routes[0].legs})
+
+    def test_unknown_location_returns_a_clear_api_validation_error(self) -> None:
+        with self.assertRaises(HTTPException) as error:
+            calculate_routes(
+                TripRequest(
+                    start="Not a city location",
+                    destination="Central Station",
+                    time=datetime(2026, 6, 15, 10, 0),
+                )
+            )
+        self.assertEqual(error.exception.status_code, 422)
+        self.assertIn("Unknown location", error.exception.detail)
 
 
 if __name__ == "__main__":
