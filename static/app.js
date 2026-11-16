@@ -12,8 +12,6 @@ const movingMarkerGroup = document.querySelector("#simulation-marker");
 const timeKind = document.querySelector("#time-kind");
 const timeLabel = document.querySelector("#time-label");
 const submitButton = form.querySelector('button[type="submit"]');
-const simulationPanel = document.querySelector("#simulation-panel");
-const testingPanel = document.querySelector("#testing-panel");
 const startSimulationButton = document.querySelector("#start-simulation");
 const playPauseButton = document.querySelector("#play-pause");
 const resetButton = document.querySelector("#reset-simulation");
@@ -24,6 +22,8 @@ const randomIncidentButton = document.querySelector("#random-incident");
 const incidentPathwaySelect = document.querySelector("#incident-pathway");
 const blockageButton = document.querySelector("#trigger-blockage");
 const delayButton = document.querySelector("#trigger-delay");
+const cyclePathwayButton = document.querySelector("#cycle-pathway-state");
+const edgeStateLive = document.querySelector("#edge-state-live");
 
 let cityGraph;
 let selectedRoute = null;
@@ -33,9 +33,13 @@ let lastFrameTime = null;
 let animationFrame = null;
 let isPlaying = false;
 let pendingTransitionUntil = null;
-let incidents = new Map();
+const edgeStates = new Map();
 const pathwayByKey = new Map();
+const pathwayElements = new Map();
+const failedObstructionSyncs = new Map();
+let obstructionSync = Promise.resolve();
 submitButton.disabled = true;
+startSimulationButton.disabled = true;
 
 function mapPoint(location) {
   return { x: 45 + location.x * 9.1, y: 805 - location.y * 7.5 };
@@ -43,6 +47,23 @@ function mapPoint(location) {
 
 function mapCoordinate(x, y) {
   return { x: 45 + x * 9.1, y: 805 - y * 7.5 };
+}
+
+function pathwayPoints(start, end, pathway) {
+  const offset = pathway === "pavement" ? 7 : pathway === "train" ? -7 : 0;
+  const length = Math.hypot(end.x - start.x, end.y - start.y) || 1;
+  const perpendicularX = -(end.y - start.y) / length;
+  const perpendicularY = (end.x - start.x) / length;
+  return {
+    start: {
+      x: start.x + perpendicularX * offset,
+      y: start.y + perpendicularY * offset,
+    },
+    end: {
+      x: end.x + perpendicularX * offset,
+      y: end.y + perpendicularY * offset,
+    },
+  };
 }
 
 function svgElement(name, attributes = {}) {
@@ -57,6 +78,12 @@ function pathwayKey(start, end, pathway) {
 
 function renderCity(graph) {
   cityGraph = graph;
+  edgeStates.clear();
+  graph.manual_obstructions.forEach((item) => {
+    if (item.kind !== "normal") {
+      edgeStates.set(pathwayKey(item.start, item.end, item.pathway), item.kind);
+    }
+  });
   const locationByName = new Map(graph.locations.map((location) => [location.name, location]));
   const options = graph.locations.map((location) => {
     const option = document.createElement("option");
@@ -66,17 +93,33 @@ function renderCity(graph) {
   datalist.replaceChildren(...options);
 
   const lines = graph.pathways.map((pathway) => {
-    const start = mapPoint(locationByName.get(pathway.start));
-    const end = mapPoint(locationByName.get(pathway.end));
+    const points = pathwayPoints(
+      mapPoint(locationByName.get(pathway.start)),
+      mapPoint(locationByName.get(pathway.end)),
+      pathway.pathway,
+    );
+    const key = pathwayKey(pathway.start, pathway.end, pathway.pathway);
+    const group = svgElement("g", { "data-edge-key": key });
     const line = svgElement("line", {
-      x1: start.x, y1: start.y, x2: end.x, y2: end.y,
-      class: `pathway pathway-${pathway.pathway}`,
+      x1: points.start.x, y1: points.start.y,
+      x2: points.end.x, y2: points.end.y,
+      class: `pathway pathway-${pathway.pathway} pathway-state`,
     });
     const title = svgElement("title");
     title.textContent = `${pathway.name}: ${pathway.start} to ${pathway.end}`;
     line.append(title);
-    pathwayByKey.set(pathwayKey(pathway.start, pathway.end, pathway.pathway), pathway);
-    return line;
+    const hitArea = svgElement("line", {
+      x1: points.start.x, y1: points.start.y,
+      x2: points.end.x, y2: points.end.y,
+      class: "pathway-hit-area",
+      "data-edge-key": key,
+      role: "button",
+      tabindex: "0",
+    });
+    pathwayByKey.set(key, pathway);
+    pathwayElements.set(key, { line, hitArea });
+    group.append(line, hitArea);
+    return group;
   });
   pathwaysGroup.replaceChildren(...lines);
 
@@ -96,10 +139,82 @@ function renderCity(graph) {
   const incidentOptions = graph.pathways.map((pathway) => {
     const option = document.createElement("option");
     option.value = pathwayKey(pathway.start, pathway.end, pathway.pathway);
-    option.textContent = `${pathway.name} — ${pathway.start} to ${pathway.end} (${pathway.pathway})`;
     return option;
   });
   incidentPathwaySelect.replaceChildren(...incidentOptions);
+  graph.pathways.forEach((pathway) => updateEdgeStateView(
+    pathwayKey(pathway.start, pathway.end, pathway.pathway),
+  ));
+  refreshObstructionIcons();
+}
+
+function stateLabel(kind) {
+  return ({ delay: "Delay", block: "Blocked" })[kind] || "Normal";
+}
+
+function updateEdgeStateView(key, announce = false) {
+  const pathway = pathwayByKey.get(key);
+  const elements = pathwayElements.get(key);
+  if (!pathway || !elements) return;
+  const kind = edgeStates.get(key) || "normal";
+  elements.line.classList.toggle("pathway-delayed", kind === "delay");
+  elements.line.classList.toggle("pathway-blocked", kind === "block");
+  const label = `${pathway.name}: ${pathway.start} to ${pathway.end} (${pathway.pathway}), ${stateLabel(kind)}`;
+  elements.hitArea.setAttribute("aria-label", label);
+  const option = [...incidentPathwaySelect.options].find((item) => item.value === key);
+  if (option) {
+    option.textContent = `${pathway.name} — ${pathway.start} to ${pathway.end} (${pathway.pathway}) — ${stateLabel(kind)}`;
+  }
+  // Keep the keyboard pathway option and its live announcement synchronized
+  // with the same state and visual class used by map-edge clicks.
+  if (announce && incidentPathwaySelect.value === key) {
+    edgeStateLive.textContent = `${pathway.name}, ${pathway.start} to ${pathway.end}: ${stateLabel(kind)}.`;
+  }
+}
+
+function queueObstructionSync(pathway, kind) {
+  const key = pathwayKey(pathway.start, pathway.end, pathway.pathway);
+  const request = obstructionSync.then(async () => {
+    const response = await fetch("/api/obstructions", {
+      method: "PUT",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({
+        start: pathway.start,
+        end: pathway.end,
+        pathway: pathway.pathway,
+        kind,
+      }),
+    });
+    const result = await response.json();
+    if (!response.ok) {
+      throw new Error(Array.isArray(result.detail)
+        ? result.detail.map((item) => item.msg).join(" ")
+        : result.detail || "The pathway state could not be synchronized.");
+    }
+    failedObstructionSyncs.delete(key);
+  });
+  obstructionSync = request.catch((error) => {
+    failedObstructionSyncs.set(key, error);
+    showError(error instanceof Error ? error.message : "The pathway state could not be synchronized.");
+  });
+  return obstructionSync;
+}
+
+async function setEdgeState(key, kind, reroute = true) {
+  const pathway = pathwayByKey.get(key);
+  if (!pathway) return;
+  if (kind === "normal") edgeStates.delete(key);
+  else edgeStates.set(key, kind);
+  updateEdgeStateView(key, true);
+  refreshObstructionIcons(journey ? journey.route : null);
+  const sync = queueObstructionSync(pathway, kind);
+  if (reroute && journey) await triggerIncident(kind, false, pathway, sync);
+}
+
+function cycleEdgeState(key) {
+  const current = edgeStates.get(key) || "normal";
+  const next = ({ normal: "delay", delay: "block", block: "normal" })[current];
+  setEdgeState(key, next);
 }
 
 function makeRouteLines(route) {
@@ -224,12 +339,18 @@ function drawObstruction(obstruction, injected = false) {
   return marker;
 }
 
-function refreshObstructionIcons(route) {
-  const markers = activeScheduledObstructions(route)
-    .map((item) => drawObstruction(item))
-    .filter(Boolean);
-  incidents.forEach((item) => {
-    const marker = drawObstruction(item, true);
+function refreshObstructionIcons(route = null) {
+  const markers = route
+    ? activeScheduledObstructions(route).map((item) => drawObstruction(item))
+    : [];
+  edgeStates.forEach((kind, key) => {
+    const pathway = pathwayByKey.get(key);
+    if (!pathway) return;
+    const marker = drawObstruction({
+      ...pathway,
+      blocked: kind === "block",
+      reason: kind === "block" ? "Manual blockage" : "Manual delay",
+    }, true);
     if (marker) markers.push(marker);
   });
   obstructionsGroup.replaceChildren(...markers);
@@ -238,11 +359,8 @@ function refreshObstructionIcons(route) {
 function selectRoute(route) {
   resetSimulation();
   selectedRoute = route;
-  incidents = new Map();
   highlightRoute(route);
   refreshObstructionIcons(route);
-  simulationPanel.hidden = false;
-  testingPanel.hidden = false;
   clockReadout.textContent = "Not started";
   etaReadout.textContent = formatTime(route.arrival);
   startSimulationButton.disabled = false;
@@ -262,9 +380,12 @@ function localDateTime(milliseconds) {
 function setTestingControls(enabled) {
   const canInject = enabled && pendingTransitionUntil === null;
   randomIncidentButton.disabled = !canInject;
-  incidentPathwaySelect.disabled = !canInject;
   blockageButton.disabled = !canInject;
   delayButton.disabled = !canInject;
+  // Keep the pathway selector and cycle button available at all times so
+  // keyboard and screen-reader users can configure states before a route.
+  incidentPathwaySelect.disabled = !cityGraph;
+  cyclePathwayButton.disabled = !cityGraph;
 }
 
 function resetSimulation() {
@@ -278,7 +399,6 @@ function resetSimulation() {
   playPauseButton.textContent = "Play";
   playPauseButton.disabled = true;
   resetButton.disabled = true;
-  speedSelect.disabled = true;
   startSimulationButton.disabled = !selectedRoute;
   setTestingControls(false);
 }
@@ -345,7 +465,7 @@ function updateSimulationFrame(frameTime) {
   lastFrameTime = frameTime;
   if (pendingTransitionUntil !== null && simulationTime >= pendingTransitionUntil) {
     pendingTransitionUntil = null;
-    setTestingControls(true);
+    setTestingControls(isPlaying);
   }
   const point = positionOnJourney(journey.route, simulationTime);
   if (point) {
@@ -366,7 +486,6 @@ function updateSimulationFrame(frameTime) {
 
 function startSimulation() {
   resetSimulation();
-  incidents = new Map();
   refreshObstructionIcons(selectedRoute);
   journey = { route: selectedRoute };
   simulationTime = new Date(selectedRoute.departure).getTime();
@@ -377,7 +496,7 @@ function startSimulation() {
   speedSelect.disabled = false;
   startSimulationButton.disabled = true;
   playPauseButton.textContent = "Pause";
-  setTestingControls(true);
+  setTestingControls(isPlaying);
   updateSimulationFrame(performance.now());
 }
 
@@ -412,7 +531,7 @@ function findIncidentPathway(selection, randomAhead) {
     const startIndex = current ? current.index : 0;
     const ahead = journey.route.legs.slice(startIndex).filter((leg) =>
       pathwayByKey.has(pathwayKey(leg.start, leg.end, leg.pathway))
-      && !incidents.has(pathwayKey(leg.start, leg.end, leg.pathway)),
+      && !edgeStates.has(pathwayKey(leg.start, leg.end, leg.pathway)),
     );
     if (!ahead.length) return null;
     const leg = ahead[Math.floor(Math.random() * ahead.length)];
@@ -421,26 +540,19 @@ function findIncidentPathway(selection, randomAhead) {
   return pathwayByKey.get(selection);
 }
 
-async function triggerIncident(kind, randomAhead = false) {
-  if (!journey || !isPlaying) return;
+async function triggerIncident(kind, randomAhead = false, chosenPathway = null, sync = Promise.resolve()) {
+  if (!journey || pendingTransitionUntil !== null) return;
+  await sync;
+  if (failedObstructionSyncs.size) return;
+  const wasPlaying = isPlaying;
   const incidentTime = simulationTime;
   const active = activeJourneyLeg();
-  const pathway = findIncidentPathway(incidentPathwaySelect.value, randomAhead);
+  const pathway = chosenPathway
+    || findIncidentPathway(incidentPathwaySelect.value, randomAhead);
   if (!active || !pathway) {
     showError("There is no pathway ahead available for a new incident.");
     return;
   }
-  const incident = {
-    start: pathway.start,
-    end: pathway.end,
-    pathway: pathway.pathway,
-    name: pathway.name,
-    kind,
-    blocked: kind === "block",
-    reason: kind === "block" ? "Unexpected blockage" : "Unexpected delay",
-  };
-  incidents.set(pathwayKey(pathway.start, pathway.end, pathway.pathway), incident);
-  refreshObstructionIcons(journey.route);
   [randomIncidentButton, blockageButton, delayButton].forEach((button) => {
     button.disabled = true;
   });
@@ -458,15 +570,17 @@ async function triggerIncident(kind, randomAhead = false) {
     current_edge_pathway: active.leg.pathway,
     progress: active.progress,
     incident: { start: pathway.start, end: pathway.end, pathway: pathway.pathway, kind },
-    additional_incidents: [...incidents.values()]
-      .filter((item) => pathwayKey(item.start, item.end, item.pathway)
-        !== pathwayKey(pathway.start, pathway.end, pathway.pathway))
-      .map((item) => ({
-        start: item.start,
-        end: item.end,
-        pathway: item.pathway,
-        kind: item.kind,
-      })),
+    additional_incidents: [...edgeStates.entries()]
+      .filter(([key]) => key !== pathwayKey(pathway.start, pathway.end, pathway.pathway))
+      .map(([key, state]) => {
+        const item = pathwayByKey.get(key);
+        return {
+          start: item.start,
+          end: item.end,
+          pathway: item.pathway,
+          kind: state,
+        };
+      }),
     avoid_tolls: data.has("avoid_tolls"),
     avoid_highways: data.has("avoid_highways"),
     priority: data.get("priority"),
@@ -505,10 +619,10 @@ async function triggerIncident(kind, randomAhead = false) {
     };
     journey = { route: rerouted };
     simulationTime = approachStart;
-    isPlaying = true;
+    isPlaying = wasPlaying;
     pendingTransitionUntil = switchTime > simulationTime ? switchTime : null;
     playPauseButton.disabled = false;
-    playPauseButton.textContent = "Pause";
+    playPauseButton.textContent = isPlaying ? "Pause" : "Play";
     highlightRoute(rerouted);
     refreshObstructionIcons(rerouted);
     // Backend suffix timestamps include the approach and driver reaction delay,
@@ -519,16 +633,25 @@ async function triggerIncident(kind, randomAhead = false) {
     if (switchTime > new Date(result.route.arrival).getTime()) {
       throw new Error("The new route arrival time is earlier than its transition.");
     }
-    setTestingControls(true);
-    animationFrame = requestAnimationFrame(updateSimulationFrame);
+    setTestingControls(isPlaying);
+    if (isPlaying) {
+      animationFrame = requestAnimationFrame(updateSimulationFrame);
+    } else {
+      const point = positionOnJourney(journey.route, simulationTime);
+      if (point) {
+        if (!movingMarkerGroup.firstChild) createJourneyMarker();
+        movingMarkerGroup.firstChild.setAttribute("transform", `translate(${point.x} ${point.y})`);
+      }
+      updateReadouts();
+    }
   } catch (error) {
     showError(error instanceof Error ? error.message : "The journey could not be rerouted.");
-    isPlaying = true;
+    isPlaying = wasPlaying;
     pendingTransitionUntil = null;
     playPauseButton.disabled = false;
-    playPauseButton.textContent = "Pause";
-    setTestingControls(true);
-    animationFrame = requestAnimationFrame(updateSimulationFrame);
+    playPauseButton.textContent = isPlaying ? "Pause" : "Play";
+    setTestingControls(isPlaying);
+    if (isPlaying) animationFrame = requestAnimationFrame(updateSimulationFrame);
   }
 }
 
@@ -542,8 +665,8 @@ form.addEventListener("submit", async (event) => {
   event.preventDefault();
   alertBox.hidden = true;
   resetSimulation();
-  simulationPanel.hidden = true;
-  testingPanel.hidden = true;
+  selectedRoute = null;
+  startSimulationButton.disabled = true;
   routeList.replaceChildren();
   selectedRouteGroup.replaceChildren();
   obstructionsGroup.replaceChildren();
@@ -563,6 +686,10 @@ form.addEventListener("submit", async (event) => {
     avoid_highways: data.has("avoid_highways"),
   };
   try {
+    await obstructionSync;
+    if (failedObstructionSyncs.size) {
+      throw new Error("Wait for pathway changes to synchronize before calculating routes.");
+    }
     const response = await fetch("/api/routes", {
       method: "POST",
       headers: { "Content-Type": "application/json" },
@@ -589,7 +716,6 @@ resetButton.addEventListener("click", () => {
   resetSimulation();
   alertBox.hidden = true;
   if (selectedRoute) {
-    incidents = new Map();
     highlightRoute(selectedRoute);
     refreshObstructionIcons(selectedRoute);
     simulationTime = new Date(selectedRoute.departure).getTime();
@@ -597,9 +723,35 @@ resetButton.addEventListener("click", () => {
     etaReadout.textContent = formatTime(selectedRoute.arrival);
   }
 });
-randomIncidentButton.addEventListener("click", () => triggerIncident("block", true));
-blockageButton.addEventListener("click", () => triggerIncident("block"));
-delayButton.addEventListener("click", () => triggerIncident("delay"));
+blockageButton.addEventListener("click", () => {
+  const key = incidentPathwaySelect.value;
+  setEdgeState(key, "block");
+});
+delayButton.addEventListener("click", () => {
+  const key = incidentPathwaySelect.value;
+  setEdgeState(key, "delay");
+});
+cyclePathwayButton.addEventListener("click", () => cycleEdgeState(incidentPathwaySelect.value));
+incidentPathwaySelect.addEventListener("change", () => {
+  updateEdgeStateView(incidentPathwaySelect.value, true);
+});
+// Wide transparent SVG strokes make map clicks forgiving; Enter/Space and the
+// always-available selector use the same three-state pathway cycle.
+pathwaysGroup.addEventListener("click", (event) => {
+  const edge = event.target.closest("[data-edge-key]");
+  if (edge) cycleEdgeState(edge.getAttribute("data-edge-key"));
+});
+pathwaysGroup.addEventListener("keydown", (event) => {
+  if (event.key !== "Enter" && event.key !== " ") return;
+  const edge = event.target.closest(".pathway-hit-area");
+  if (!edge) return;
+  event.preventDefault();
+  cycleEdgeState(edge.getAttribute("data-edge-key"));
+});
+randomIncidentButton.addEventListener("click", () => {
+  const pathway = findIncidentPathway("", true);
+  if (pathway) setEdgeState(pathwayKey(pathway.start, pathway.end, pathway.pathway), "block");
+});
 
 async function loadCity() {
   try {
@@ -607,6 +759,7 @@ async function loadCity() {
     if (!response.ok) throw new Error("The city map could not be loaded.");
     renderCity(await response.json());
     submitButton.disabled = false;
+    setTestingControls(false);
   } catch (error) {
     showError(error instanceof Error ? error.message : "The city map could not be loaded.");
     submitButton.disabled = true;

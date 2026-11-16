@@ -242,8 +242,9 @@ class CityMap:
                 raise ValueError("Train pathways must specify a line name.")
         if distance_km is None:
             first, second = self.locations[start], self.locations[end]
-            # Coordinates are city-grid kilometres; the factor models non-straight streets.
-            distance_km = math.hypot(first.x - second.x, first.y - second.y) * 1.12
+            # One map unit is 0.28 km; this adds street curvature without making
+            # a short neighborhood link look like a cross-city trip.
+            distance_km = math.hypot(first.x - second.x, first.y - second.y) * 0.28
         for origin, destination in ((start, end), (end, start)):
             self.adjacency[origin].append(
                 Edge(
@@ -325,7 +326,7 @@ class CityMap:
         for start, end, street, speed, highway, toll in roads:
             self._add_edge(start, end, Pathway.ROAD, street, speed, highway=highway, toll=toll)
             if not highway:
-                self._add_edge(start, end, Pathway.PAVEMENT, f"{street} pavement", 5)
+                self._add_edge(start, end, Pathway.PAVEMENT, f"{street} pavement", 5.5)
 
         # Pedestrian-only shortcuts connect parks, neighbourhoods, and local paths.
         footpaths = [
@@ -341,7 +342,7 @@ class CityMap:
             ("Old Bridge", "Southbank", "Riverside Promenade"),
         ]
         for start, end, path_name in footpaths:
-            self._add_edge(start, end, Pathway.PAVEMENT, path_name, 5)
+            self._add_edge(start, end, Pathway.PAVEMENT, path_name, 5.5)
 
         # Every rail segment joins stations and belongs to the named Central Line.
         rail_stops = [
@@ -359,7 +360,7 @@ class CityMap:
                 end,
                 Pathway.TRAIN,
                 "Central Line",
-                60,
+                90,
                 train_line="Central Line",
             )
 
@@ -403,6 +404,7 @@ class CityMap:
         at: datetime,
         mode: Optional[TravelMode] = None,
         obstructions: tuple[Obstruction, ...] = (),
+        board_train: bool = True,
     ) -> Leg:
         """Calculate an edge's travel and waiting time at the supplied instant."""
         speed_factor = 1.0
@@ -411,13 +413,17 @@ class CityMap:
                 if obstruction.is_active(edge, at, mode) and not obstruction.blocked:
                     speed_factor *= obstruction.speed_factor
         if edge.pathway is Pathway.TRAIN:
-            departure = self.next_train_departure(at)
+            # Wait for a scheduled departure only when boarding or changing lines;
+            # same-line stops are through travel, not a fresh station transfer.
+            departure = self.next_train_departure(at) if board_train else at
             duration = timedelta(
                 hours=edge.distance_km / edge.speed_limit_kmh * speed_factor
             )
             return Leg(edge, departure, departure + duration)
 
         departure = at
+        # Duration is scaled kilometres / pathway speed; an obstruction factor
+        # multiplies duration, equivalent to reducing the effective speed.
         hours = edge.distance_km / edge.speed_limit_kmh
         if edge.pathway is Pathway.ROAD and self._is_rush_hour(at):
             hours *= 1.6
@@ -499,7 +505,17 @@ class CityMap:
                     for obstruction in (*self.SCHEDULED_OBSTRUCTIONS, *obstructions)
                 ):
                     continue
-                leg = self._leg_for(edge, current_time, mode, obstructions)
+                board_train = (
+                    edge.pathway is Pathway.TRAIN
+                    and (
+                        not legs
+                        or legs[-1].edge.pathway is not Pathway.TRAIN
+                        or legs[-1].edge.train_line != edge.train_line
+                    )
+                )
+                leg = self._leg_for(
+                    edge, current_time, mode, obstructions, board_train
+                )
                 updated_legs = legs + (leg,)
                 updated_path = path + (edge.end,)
                 updated_elapsed = (leg.arrival - departure).total_seconds() / 60
@@ -608,7 +624,17 @@ class CityMap:
                 )
             ):
                 return None
-            leg = self._leg_for(edge, current_time, mode, obstructions)
+            board_train = (
+                edge.pathway is Pathway.TRAIN
+                and (
+                    not timed_legs
+                    or timed_legs[-1].edge.pathway is not Pathway.TRAIN
+                    or timed_legs[-1].edge.train_line != edge.train_line
+                )
+            )
+            leg = self._leg_for(
+                edge, current_time, mode, obstructions, board_train
+            )
             timed_legs.append(leg)
             current_time = leg.arrival
         return Route(locations, tuple(timed_legs), departure)
@@ -780,7 +806,16 @@ class IncidentRequest(BaseModel):
     start: str = Field(min_length=1, max_length=100)
     end: str = Field(min_length=1, max_length=100)
     pathway: Literal["road", "pavement", "train"]
-    kind: Literal["block", "delay"]
+    kind: Literal["normal", "block", "delay"]
+
+
+class ManualObstructionRequest(BaseModel):
+    """Set or clear a user-managed obstruction on one map pathway."""
+
+    start: str = Field(min_length=1, max_length=100)
+    end: str = Field(min_length=1, max_length=100)
+    pathway: Literal["road", "pavement", "train"]
+    kind: Literal["normal", "delay", "block"]
 
 
 class RerouteRequest(BaseModel):
@@ -827,6 +862,16 @@ class CityResponse(BaseModel):
     locations: list[LocationResponse]
     pathways: list[PathwayResponse]
     obstructions: list["ScheduledObstructionResponse"]
+    manual_obstructions: list["ManualObstructionResponse"]
+
+
+class ManualObstructionResponse(BaseModel):
+    """Current user-managed state for one pathway."""
+
+    start: str
+    end: str
+    pathway: str
+    kind: Literal["normal", "delay", "block"]
 
 
 class ScheduledObstructionResponse(BaseModel):
@@ -892,6 +937,7 @@ class RerouteResponse(BaseModel):
 
 app = FastAPI(title="City Navigator", version="1.0.0")
 city = CityMap()
+manual_obstructions: dict[tuple[str, str, str], Obstruction] = {}
 static_directory = Path(__file__).resolve().parent / "static"
 app.mount("/static", StaticFiles(directory=static_directory), name="static")
 
@@ -950,7 +996,67 @@ def get_city() -> CityResponse:
         )
         for obstruction in city.SCHEDULED_OBSTRUCTIONS
     ]
-    return CityResponse(locations=locations, pathways=pathways, obstructions=obstructions)
+    manual_states = [
+        ManualObstructionResponse(
+            start=obstruction.start,
+            end=obstruction.end,
+            pathway=obstruction.pathway.value,
+            kind="block" if obstruction.blocked else "delay",
+        )
+        for obstruction in manual_obstructions.values()
+    ]
+    return CityResponse(
+        locations=locations,
+        pathways=pathways,
+        obstructions=obstructions,
+        manual_obstructions=manual_states,
+    )
+
+
+def _manual_obstruction_key(
+    start: str, end: str, pathway: Pathway
+) -> tuple[str, str, str]:
+    """Build the direction-independent key shared by both records of an edge."""
+    first, second = sorted((start, end))
+    return first, second, pathway.value
+
+
+@app.put("/api/obstructions", response_model=ManualObstructionResponse)
+def update_manual_obstruction(
+    request: ManualObstructionRequest,
+) -> ManualObstructionResponse:
+    """Synchronize a map-selected pathway state for all subsequent route searches."""
+    try:
+        edge = next(
+            item
+            for item in city.adjacency[request.start]
+            if item.end == request.end and item.pathway.value == request.pathway
+        )
+    except (KeyError, StopIteration) as error:
+        raise HTTPException(
+            status_code=422, detail="The selected pathway is unknown."
+        ) from error
+
+    key = _manual_obstruction_key(edge.start, edge.end, edge.pathway)
+    if request.kind == "normal":
+        manual_obstructions.pop(key, None)
+    else:
+        manual_obstructions[key] = Obstruction(
+            edge.start,
+            edge.end,
+            edge.pathway,
+            edge.name,
+            "Manual blockage" if request.kind == "block" else "Manual delay",
+            tuple(TravelMode),
+            request.kind == "block",
+            3.0,
+        )
+    return ManualObstructionResponse(
+        start=edge.start,
+        end=edge.end,
+        pathway=edge.pathway.value,
+        kind=request.kind,
+    )
 
 
 def _route_response(route: Route, route_id: int) -> RouteResponse:
@@ -999,11 +1105,23 @@ def calculate_routes(request: TripRequest) -> RoutesResponse:
     )
     if request.time_kind == "arrival":
         routes = city.routes_arriving_by(
-            start, destination, request.time, mode, preferences, limit=request.limit
+            start,
+            destination,
+            request.time,
+            mode,
+            preferences,
+            limit=request.limit,
+            obstructions=tuple(manual_obstructions.values()),
         )
     else:
         routes = city.find_routes(
-            start, destination, request.time, mode, preferences, limit=request.limit
+            start,
+            destination,
+            request.time,
+            mode,
+            preferences,
+            limit=request.limit,
+            obstructions=tuple(manual_obstructions.values()),
         )
     if not routes:
         raise HTTPException(
@@ -1047,7 +1165,7 @@ def calculate_reroute(request: RerouteRequest) -> RerouteResponse:
             status_code=422,
             detail="The current pathway is not valid for this travel mode.",
         )
-    obstructions: list[Obstruction] = []
+    obstruction_by_key = dict(manual_obstructions)
     try:
         for item in (request.incident, *request.additional_incidents):
             incident_edge = next(
@@ -1056,34 +1174,33 @@ def calculate_reroute(request: RerouteRequest) -> RerouteResponse:
                 if edge_item.end == item.end
                 and edge_item.pathway.value == item.pathway
             )
-            obstruction_key = (
+            obstruction_key = _manual_obstruction_key(
+                incident_edge.start, incident_edge.end, incident_edge.pathway
+            )
+            if item.kind == "normal":
+                obstruction_by_key.pop(obstruction_key, None)
+                continue
+            obstruction_by_key[obstruction_key] = Obstruction(
                 incident_edge.start,
                 incident_edge.end,
                 incident_edge.pathway,
-            )
-            if any(
-                (existing.start, existing.end, existing.pathway) == obstruction_key
-                or (existing.end, existing.start, existing.pathway) == obstruction_key
-                for existing in obstructions
-            ):
-                continue
-            obstructions.append(
-                Obstruction(
-                    incident_edge.start,
-                    incident_edge.end,
-                    incident_edge.pathway,
-                    incident_edge.name,
-                    "Injected blockage" if item.kind == "block" else "Injected delay",
-                    (mode,),
-                    item.kind == "block",
-                    3.0,
-                )
+                incident_edge.name,
+                "Injected blockage" if item.kind == "block" else "Injected delay",
+                tuple(TravelMode),
+                item.kind == "block",
+                3.0,
             )
     except (KeyError, StopIteration) as error:
         raise HTTPException(
             status_code=422, detail="The obstructed pathway is unknown."
         ) from error
-    incident = obstructions[0]
+    obstructions = list(obstruction_by_key.values())
+    incident_key = _manual_obstruction_key(
+        request.incident.start,
+        request.incident.end,
+        Pathway(request.incident.pathway),
+    )
+    incident = obstruction_by_key.get(incident_key)
     preferences = Preferences(
         avoid_tolls=request.avoid_tolls,
         avoid_highways=request.avoid_highways,
@@ -1184,7 +1301,7 @@ def calculate_reroute(request: RerouteRequest) -> RerouteResponse:
         approach_start_y=current_y,
         approach_end_x=switch_location.x,
         approach_end_y=switch_location.y,
-        reason=incident.reason,
+        reason=incident.reason if incident else "The pathway obstruction was cleared",
         route=_route_response(route, 1),
     )
 

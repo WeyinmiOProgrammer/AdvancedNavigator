@@ -11,6 +11,7 @@ from fastapi import HTTPException
 from app import (
     CityMap,
     IncidentRequest,
+    ManualObstructionRequest,
     Pathway,
     Preferences,
     RerouteRequest,
@@ -19,7 +20,9 @@ from app import (
     calculate_routes,
     calculate_reroute,
     get_city,
+    manual_obstructions,
     render_svg,
+    update_manual_obstruction,
 )
 
 
@@ -67,6 +70,36 @@ class CityMapTests(unittest.TestCase):
                     TravelMode.WALKING,
                     limit=3,
                 )[0].legs
+            )
+        )
+
+    def test_scaled_distances_make_local_walks_practical(self) -> None:
+        """A short neighborhood walk is measured in minutes, not several hours."""
+        routes = self.city.find_routes(
+            "Old Town",
+            "Central Station",
+            datetime(2026, 6, 15, 10, 0),
+            TravelMode.WALKING,
+            limit=1,
+        )
+        self.assertAlmostEqual(routes[0].distance_km, 8.13, places=1)
+        self.assertLess(routes[0].duration.total_seconds(), 2 * 60 * 60)
+
+    def test_direct_peak_hour_train_corridor_competes_with_driving(self) -> None:
+        """A through train ride avoids repeated stop waits and peak-road slowdown."""
+        when = datetime(2026, 6, 15, 8, 0)
+        transit = self.city.find_routes(
+            "Central Station", "Airport Station", when, TravelMode.TRANSIT, limit=1
+        )[0]
+        driving = self.city.find_routes(
+            "Central Station", "Airport Station", when, TravelMode.DRIVING, limit=1
+        )[0]
+        self.assertLess(transit.duration, driving.duration)
+        self.assertTrue(all(leg.edge.pathway is Pathway.TRAIN for leg in transit.legs))
+        self.assertTrue(
+            all(
+                previous.arrival == current.departure
+                for previous, current in zip(transit.legs, transit.legs[1:])
             )
         )
 
@@ -193,6 +226,12 @@ class CityMapTests(unittest.TestCase):
 
 class WebApiTests(unittest.TestCase):
     """Verify that the browser API adapts the existing simulator correctly."""
+
+    def setUp(self) -> None:
+        manual_obstructions.clear()
+
+    def tearDown(self) -> None:
+        manual_obstructions.clear()
 
     def test_city_response_contains_fixed_nodes_and_each_pathway_once(self) -> None:
         response = get_city()
@@ -338,6 +377,47 @@ class WebApiTests(unittest.TestCase):
         self.assertGreater(route.duration_minutes, 0)
         self.assertTrue(route.legs)
         self.assertTrue(all(leg.pathway == "pavement" for leg in route.legs))
+
+    def test_manual_pathway_state_cycles_and_changes_route_calculation(self) -> None:
+        """Map state is returned by the API and a blocked edge is avoided."""
+        request = ManualObstructionRequest(
+            start="Old Town",
+            end="Market Square",
+            pathway="road",
+            kind="delay",
+        )
+        update_manual_obstruction(request)
+        self.assertEqual(get_city().manual_obstructions[0].kind, "delay")
+
+        update_manual_obstruction(
+            ManualObstructionRequest(
+                start=request.start,
+                end=request.end,
+                pathway=request.pathway,
+                kind="block",
+            )
+        )
+        route = calculate_routes(
+            TripRequest(
+                start="Old Town",
+                destination="Market Square",
+                time=datetime(2026, 6, 15, 12, 0),
+                mode="driving",
+            )
+        ).routes[0]
+        self.assertFalse(
+            any(leg.start == "Old Town" and leg.end == "Market Square" for leg in route.legs)
+        )
+
+        update_manual_obstruction(
+            ManualObstructionRequest(
+                start=request.start,
+                end=request.end,
+                pathway=request.pathway,
+                kind="normal",
+            )
+        )
+        self.assertFalse(get_city().manual_obstructions)
 
     def test_transit_request_uses_the_simulator_public_transit_mode(self) -> None:
         response = calculate_routes(
