@@ -94,7 +94,8 @@
           <li><span class="legend-line selected" aria-hidden="true"></span>Selected route</li>
           <li><span class="legend-line delayed" aria-hidden="true"></span>Delayed pathway</li>
           <li><span class="legend-line blocked" aria-hidden="true"></span>Blocked pathway</li>
-          <li><span class="legend-warning" aria-hidden="true">!</span>Scheduled disruption</li>
+          <li><span class="legend-warning delayed" aria-hidden="true">!</span>Delay warning</li>
+          <li><span class="legend-warning blocked" aria-hidden="true">×</span>Blockage warning</li>
         </ul>
       </div>
       <div class="map-frame">
@@ -103,10 +104,11 @@
           <title>City pathway map</title>
           <desc>Choose a route to highlight its path between locations.</desc>
           <g id="pathways"></g>
-          <g id="map-obstructions"></g>
           <g id="selected-route"></g>
           <g id="map-locations"></g>
           <g id="simulation-marker"></g>
+          <!-- Obstruction symbols stay above routes, nodes, and the moving marker. -->
+          <g id="map-obstructions"></g>
         </svg>
       </div>
     </section>
@@ -120,11 +122,10 @@
         <label for="simulation-speed">Simulation speed</label>
         <select id="simulation-speed">
           <option value="1">1x</option>
-          <option value="10">10x</option>
-          <option value="20">20x</option>
           <option value="30">30x</option>
           <option value="60">60x</option>
           <option value="120">120x</option>
+          <option value="240">240x</option>
         </select>
       </div>
       <p class="simulation-readout">

@@ -38,17 +38,24 @@ const pathwayByKey = new Map();
 const pathwayElements = new Map();
 const failedObstructionSyncs = new Map();
 let obstructionSync = Promise.resolve();
+let routeRefreshTimer = null;
+let routeRefreshGeneration = 0;
+let routeRefreshInFlight = false;
+let routeRefreshPending = false;
 submitButton.disabled = true;
 startSimulationButton.disabled = true;
 
+// Convert the backend's city coordinates into the SVG viewBox.
 function mapPoint(location) {
   return { x: 45 + location.x * 9.1, y: 805 - location.y * 7.5 };
 }
 
+// Convert a partial-edge position returned by the rerouting API to SVG space.
 function mapCoordinate(x, y) {
   return { x: 45 + x * 9.1, y: 805 - y * 7.5 };
 }
 
+// Offset parallel pathway types so roads, pavements, and rail remain distinguishable.
 function pathwayPoints(start, end, pathway) {
   const offset = pathway === "pavement" ? 7 : pathway === "train" ? -7 : 0;
   const length = Math.hypot(end.x - start.x, end.y - start.y) || 1;
@@ -66,16 +73,19 @@ function pathwayPoints(start, end, pathway) {
   };
 }
 
+// Create a namespaced SVG element and apply its attributes.
 function svgElement(name, attributes = {}) {
   const element = document.createElementNS("http://www.w3.org/2000/svg", name);
   for (const [key, value] of Object.entries(attributes)) element.setAttribute(key, value);
   return element;
 }
 
+// Canonicalize an undirected edge for state and selection maps.
 function pathwayKey(start, end, pathway) {
   return [start, end].sort().concat(pathway).join("|");
 }
 
+// Populate the map, location picker, and editable pathway state from the city API.
 function renderCity(graph) {
   cityGraph = graph;
   edgeStates.clear();
@@ -148,10 +158,12 @@ function renderCity(graph) {
   refreshObstructionIcons();
 }
 
+// Convert the internal state value into wording used by controls and announcements.
 function stateLabel(kind) {
   return ({ delay: "Delay", block: "Blocked" })[kind] || "Normal";
 }
 
+// Keep the visible edge style, accessible name, picker label, and announcement aligned.
 function updateEdgeStateView(key, announce = false) {
   const pathway = pathwayByKey.get(key);
   const elements = pathwayElements.get(key);
@@ -172,6 +184,7 @@ function updateEdgeStateView(key, announce = false) {
   }
 }
 
+// Serialize state changes so the server applies rapid toggles in their original order.
 function queueObstructionSync(pathway, kind) {
   const key = pathwayKey(pathway.start, pathway.end, pathway.pathway);
   const request = obstructionSync.then(async () => {
@@ -200,6 +213,7 @@ function queueObstructionSync(pathway, kind) {
   return obstructionSync;
 }
 
+// Apply a pathway change locally, synchronize it, then update the route or active journey.
 async function setEdgeState(key, kind, reroute = true) {
   const pathway = pathwayByKey.get(key);
   if (!pathway) return;
@@ -209,14 +223,17 @@ async function setEdgeState(key, kind, reroute = true) {
   refreshObstructionIcons(journey ? journey.route : null);
   const sync = queueObstructionSync(pathway, kind);
   if (reroute && journey) await triggerIncident(kind, false, pathway, sync);
+  else if (reroute) scheduleAutomaticRouteRefresh();
 }
 
+// Cycle an edge through its three supported states.
 function cycleEdgeState(key) {
   const current = edgeStates.get(key) || "normal";
   const next = ({ normal: "delay", delay: "block", block: "normal" })[current];
   setEdgeState(key, next);
 }
 
+// Produce SVG lines for the timed legs of a route, including partial edges.
 function makeRouteLines(route) {
   const locationByName = new Map(cityGraph.locations.map((location) => [location.name, location]));
   return route.legs.map((leg) => {
@@ -232,6 +249,7 @@ function makeRouteLines(route) {
   });
 }
 
+// Draw a route and its endpoints, and synchronize the selected route card.
 function highlightRoute(route) {
   const locationByName = new Map(cityGraph.locations.map((location) => [location.name, location]));
   const markers = [route.locations[0], route.locations[route.locations.length - 1]]
@@ -255,19 +273,22 @@ function highlightRoute(route) {
   svg.setAttribute("aria-label", `City map with selected route: ${route.locations.join(" to ")}`);
 }
 
+// Format an API timestamp for the route cards and readouts.
 function formatTime(value) {
   return new Intl.DateTimeFormat(undefined, {
     dateStyle: "medium", timeStyle: "short",
   }).format(new Date(value));
 }
 
+// Calculate the remaining whole minutes from the simulator's current clock.
 function routeDuration(route) {
   return Math.max(0, Math.ceil(
     (new Date(route.arrival).getTime() - simulationTime) / 60000,
   ));
 }
 
-function showRoutes(routes) {
+// Rebuild route cards and keep the prior route index when it is still available.
+function showRoutes(routes, preferredRouteId = null) {
   routeList.replaceChildren();
   routes.forEach((route) => {
     const card = document.createElement("button");
@@ -289,9 +310,10 @@ function showRoutes(routes) {
     routeList.append(card);
   });
   routeHint.textContent = `${routes.length} route option${routes.length === 1 ? "" : "s"} found.`;
-  selectRoute(routes[0]);
+  selectRoute(routes.find((route) => route.id === preferredRouteId) || routes[0]);
 }
 
+// Find scheduled disruptions that apply at departure or while traversing a leg.
 function activeScheduledObstructions(route) {
   const tripMode = form.elements.mode.value;
   const tripDate = new Date(route.departure);
@@ -316,6 +338,7 @@ function activeScheduledObstructions(route) {
   });
 }
 
+// Create a labeled warning symbol at the midpoint of an obstructed pathway.
 function drawObstruction(obstruction, injected = false) {
   const start = cityGraph.locations.find((item) => item.name === obstruction.start);
   const end = cityGraph.locations.find((item) => item.name === obstruction.end);
@@ -324,13 +347,17 @@ function drawObstruction(obstruction, injected = false) {
   const second = mapPoint(end);
   const x = (first.x + second.x) / 2;
   const y = (first.y + second.y) / 2;
-  const marker = svgElement("g", { "aria-label": obstruction.reason });
+  const marker = svgElement("g", {
+    "aria-label": obstruction.reason,
+    class: obstruction.blocked ? "obstruction-blocked" : "obstruction-delayed",
+  });
   marker.append(svgElement("circle", {
     cx: x, cy: y, r: 11,
-    class: `obstruction-marker${injected ? " obstruction-injected" : ""}`,
+    class: `obstruction-marker${injected ? " obstruction-injected" : ""}${obstruction.blocked ? " obstruction-blocked" : ""}`,
   }));
   const label = svgElement("text", {
-    x, y: y + 5, class: "obstruction-label",
+    x, y: y + 5,
+    class: `obstruction-label${obstruction.blocked ? " obstruction-blocked" : ""}`,
   });
   label.textContent = injected && obstruction.blocked ? "×" : "!";
   const title = svgElement("title");
@@ -339,6 +366,7 @@ function drawObstruction(obstruction, injected = false) {
   return marker;
 }
 
+// Redraw applicable scheduled notices and all manually selected pathway notices.
 function refreshObstructionIcons(route = null) {
   const markers = route
     ? activeScheduledObstructions(route).map((item) => drawObstruction(item))
@@ -356,6 +384,7 @@ function refreshObstructionIcons(route = null) {
   obstructionsGroup.replaceChildren(...markers);
 }
 
+// Set the selected route and reset playback to the route's initial state.
 function selectRoute(route) {
   resetSimulation();
   selectedRoute = route;
@@ -367,16 +396,19 @@ function selectRoute(route) {
   setTestingControls(false);
 }
 
+// Present an error in the shared polite live region.
 function showError(message) {
   alertBox.textContent = message;
   alertBox.hidden = false;
 }
 
+// Serialize a JavaScript timestamp as local wall-clock time for datetime-local inputs.
 function localDateTime(milliseconds) {
   const date = new Date(milliseconds - new Date(milliseconds).getTimezoneOffset() * 60000);
   return date.toISOString().slice(0, 19);
 }
 
+// Enable incident controls only while journey playback can accept a new event.
 function setTestingControls(enabled) {
   const canInject = enabled && pendingTransitionUntil === null;
   randomIncidentButton.disabled = !canInject;
@@ -388,6 +420,7 @@ function setTestingControls(enabled) {
   cyclePathwayButton.disabled = !cityGraph;
 }
 
+// Stop playback and clear transient journey state without discarding the route.
 function resetSimulation() {
   if (animationFrame !== null) cancelAnimationFrame(animationFrame);
   animationFrame = null;
@@ -403,6 +436,7 @@ function resetSimulation() {
   setTestingControls(false);
 }
 
+// Create the SVG marker that moves along the active journey.
 function createJourneyMarker() {
   const marker = svgElement("g", { "aria-label": "Current journey position" });
   marker.append(
@@ -413,6 +447,7 @@ function createJourneyMarker() {
   return marker;
 }
 
+// Find the map position corresponding to a timestamp along the route.
 function positionOnJourney(route, atTime) {
   const locationByName = new Map(cityGraph.locations.map((location) => [location.name, location]));
   if (!route.legs.length) {
@@ -447,6 +482,7 @@ function positionOnJourney(route, atTime) {
   return lastPoint;
 }
 
+// Refresh the simulated clock and estimated arrival text.
 function updateReadouts() {
   clockReadout.textContent = formatTime(simulationTime);
   const remaining = routeDuration(journey.route);
@@ -455,6 +491,7 @@ function updateReadouts() {
     : `${formatTime(journey.route.arrival)} · ${remaining} min remaining`;
 }
 
+// Advance the journey clock and position marker by one animation frame.
 function updateSimulationFrame(frameTime) {
   if (!isPlaying || !journey) return;
   if (lastFrameTime !== null) {
@@ -484,6 +521,7 @@ function updateSimulationFrame(frameTime) {
   animationFrame = requestAnimationFrame(updateSimulationFrame);
 }
 
+// Start playback from the selected route's requested departure.
 function startSimulation() {
   resetSimulation();
   refreshObstructionIcons(selectedRoute);
@@ -500,6 +538,7 @@ function startSimulation() {
   updateSimulationFrame(performance.now());
 }
 
+// Pause or resume playback without changing the simulated journey time.
 function togglePlayback() {
   if (!journey) return;
   isPlaying = !isPlaying;
@@ -509,6 +548,7 @@ function togglePlayback() {
   if (isPlaying) animationFrame = requestAnimationFrame(updateSimulationFrame);
 }
 
+// Return the current leg and progress for incident placement.
 function activeJourneyLeg() {
   if (!journey) return null;
   const legs = journey.route.legs;
@@ -525,6 +565,7 @@ function activeJourneyLeg() {
   return null;
 }
 
+// Select an unobstructed pathway on the remaining journey for a random incident.
 function findIncidentPathway(selection, randomAhead) {
   if (randomAhead) {
     const current = activeJourneyLeg();
@@ -540,6 +581,7 @@ function findIncidentPathway(selection, randomAhead) {
   return pathwayByKey.get(selection);
 }
 
+// Request and apply a mid-journey reroute around the selected incident.
 async function triggerIncident(kind, randomAhead = false, chosenPathway = null, sync = Promise.resolve()) {
   if (!journey || pendingTransitionUntil !== null) return;
   await sync;
@@ -655,14 +697,109 @@ async function triggerIncident(kind, randomAhead = false, chosenPathway = null, 
   }
 }
 
+// Resolve valid form selections without prompting or triggering browser validation UI.
+function hasValidRouteSelections() {
+  if (!cityGraph) return false;
+  const names = new Set(cityGraph.locations.map((location) => location.name.toLowerCase()));
+  const start = form.elements.start.value.trim().toLowerCase();
+  const destination = form.elements.destination.value.trim().toLowerCase();
+  return names.has(start) && names.has(destination) && form.elements.time.validity.valid;
+}
+
+// Build the same route request body for manual searches and automatic refreshes.
+function routeRequestPayload() {
+  const data = new FormData(form);
+  return {
+    start: data.get("start"),
+    destination: data.get("destination"),
+    time_kind: data.get("time_kind"),
+    time: data.get("time"),
+    mode: data.get("mode"),
+    priority: data.get("priority"),
+    avoid_tolls: data.has("avoid_tolls"),
+    avoid_highways: data.has("avoid_highways"),
+  };
+}
+
+// Debounce pre-simulation pathway edits and invalidate any older response.
+function scheduleAutomaticRouteRefresh(delay = 250) {
+  if (journey || !hasValidRouteSelections()) return;
+  routeRefreshGeneration += 1;
+  const generation = routeRefreshGeneration;
+  if (routeRefreshTimer !== null) clearTimeout(routeRefreshTimer);
+  routeRefreshTimer = setTimeout(() => {
+    routeRefreshTimer = null;
+    refreshRoutesAutomatically(generation);
+  }, delay);
+}
+
+// Recalculate after pathway synchronization and discard stale or overlapping results.
+async function refreshRoutesAutomatically(generation) {
+  if (generation !== routeRefreshGeneration || journey) return;
+  if (routeRefreshInFlight) {
+    routeRefreshPending = true;
+    return;
+  }
+  routeRefreshInFlight = true;
+  try {
+    await obstructionSync;
+    if (generation !== routeRefreshGeneration || journey) return;
+    if (failedObstructionSyncs.size) {
+      throw new Error("Wait for pathway changes to synchronize before calculating routes.");
+    }
+    const response = await fetch("/api/routes", {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify(routeRequestPayload()),
+    });
+    const result = await response.json();
+    if (!response.ok) {
+      throw new Error(Array.isArray(result.detail)
+        ? result.detail.map((item) => item.msg).join(" ")
+        : result.detail || "The route request could not be completed.");
+    }
+    if (generation !== routeRefreshGeneration || journey) return;
+    const selectedId = selectedRoute && selectedRoute.id;
+    alertBox.hidden = true;
+    showRoutes(result.routes, selectedId);
+  } catch (error) {
+    if (generation !== routeRefreshGeneration || journey) return;
+    clearRouteResults(error instanceof Error ? error.message : "The routes could not be refreshed.");
+  } finally {
+    routeRefreshInFlight = false;
+    if (routeRefreshPending) {
+      routeRefreshPending = false;
+      scheduleAutomaticRouteRefresh(0);
+    }
+  }
+}
+
+// Remove stale route choices and announce why no current route can be shown.
+function clearRouteResults(message) {
+  selectedRoute = null;
+  resetSimulation();
+  routeList.replaceChildren();
+  selectedRouteGroup.replaceChildren();
+  refreshObstructionIcons();
+  routeHint.textContent = "No route options to display.";
+  svg.setAttribute("aria-label", "Map of city locations and roads, pavements, and train lines");
+  showError(message);
+}
+
+// Keep the label synchronized with the selected departure/arrival constraint.
 timeKind.addEventListener("change", () => {
   timeLabel.textContent = timeKind.value === "arrival"
     ? "Arrival date and time"
     : "Departure date and time";
 });
 
+// Run a user-requested search, clearing the old choice before displaying results.
 form.addEventListener("submit", async (event) => {
   event.preventDefault();
+  if (routeRefreshTimer !== null) clearTimeout(routeRefreshTimer);
+  routeRefreshTimer = null;
+  routeRefreshGeneration += 1;
+  routeRefreshPending = false;
   alertBox.hidden = true;
   resetSimulation();
   selectedRoute = null;
@@ -674,17 +811,6 @@ form.addEventListener("submit", async (event) => {
   routeHint.textContent = "Calculating routes…";
   submitButton.disabled = true;
 
-  const data = new FormData(form);
-  const payload = {
-    start: data.get("start"),
-    destination: data.get("destination"),
-    time_kind: data.get("time_kind"),
-    time: data.get("time"),
-    mode: data.get("mode"),
-    priority: data.get("priority"),
-    avoid_tolls: data.has("avoid_tolls"),
-    avoid_highways: data.has("avoid_highways"),
-  };
   try {
     await obstructionSync;
     if (failedObstructionSyncs.size) {
@@ -693,7 +819,7 @@ form.addEventListener("submit", async (event) => {
     const response = await fetch("/api/routes", {
       method: "POST",
       headers: { "Content-Type": "application/json" },
-      body: JSON.stringify(payload),
+      body: JSON.stringify(routeRequestPayload()),
     });
     const result = await response.json();
     if (!response.ok) {
@@ -710,6 +836,7 @@ form.addEventListener("submit", async (event) => {
   }
 });
 
+// Wire playback controls to the journey state machine.
 startSimulationButton.addEventListener("click", startSimulation);
 playPauseButton.addEventListener("click", togglePlayback);
 resetButton.addEventListener("click", () => {
@@ -723,6 +850,7 @@ resetButton.addEventListener("click", () => {
     etaReadout.textContent = formatTime(selectedRoute.arrival);
   }
 });
+// Buttons and the selector provide keyboard-accessible alternatives to map clicks.
 blockageButton.addEventListener("click", () => {
   const key = incidentPathwaySelect.value;
   setEdgeState(key, "block");
@@ -753,6 +881,7 @@ randomIncidentButton.addEventListener("click", () => {
   if (pathway) setEdgeState(pathwayKey(pathway.start, pathway.end, pathway.pathway), "block");
 });
 
+// Load the city graph once before making route and disruption controls available.
 async function loadCity() {
   try {
     const response = await fetch("/api/city");
@@ -766,7 +895,7 @@ async function loadCity() {
   }
 }
 
-// Keep datetime-local values in the simulator's local wall-clock timezone.
+// Initialize the form with local time, then load the graph before enabling searches.
 const defaultTime = new Date();
 defaultTime.setMinutes(defaultTime.getMinutes() - defaultTime.getTimezoneOffset());
 form.elements.time.value = defaultTime.toISOString().slice(0, 16);

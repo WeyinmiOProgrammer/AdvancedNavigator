@@ -63,6 +63,7 @@ input, select, button { font: inherit; }
 .alert[hidden] { display: none; }
 .section-heading { display: flex; justify-content: space-between; align-items: start; gap: 1rem; }
 .section-heading p, #route-hint { margin: -.5rem 0 1rem; color: #475569; }
+/* Keep the legend's line patterns and warning symbols consistent with the SVG map. */
 .legend { display: flex; flex-wrap: wrap; gap: .6rem 1rem; margin: 0; padding: 0; list-style: none; font-size: .9rem; }
 .legend li { display: flex; align-items: center; gap: .4rem; white-space: nowrap; }
 .legend-line { display: inline-block; width: 1.5rem; border-top: 3px solid; }
@@ -70,21 +71,26 @@ input, select, button { font: inherit; }
 .legend-line.pavement { border-color: #697586; border-top-style: dotted; }
 .legend-line.train { border-color: #9a5700; border-top-style: dashed; }
 .legend-line.selected { border-color: #b42318; border-top-width: 5px; }
-.legend-line.delayed { border-color: #b54708; border-top-style: dashed; }
-.legend-line.blocked { border-color: #b42318; border-top-width: 5px; }
-.legend-warning { display: inline-grid; width: 1.15rem; height: 1.15rem; place-items: center; border: 2px solid #b54708; border-radius: 50%; color: #7a2e0e; background: #fff4e5; font-size: .8rem; font-weight: 800; }
+.legend-line.delayed { border-color: #e65100; border-top-width: 4px; border-top-style: dashed; }
+.legend-line.blocked { border-color: #c00050; border-top-width: 5px; border-top-style: dotted; }
+.legend-warning { display: inline-grid; width: 1.15rem; height: 1.15rem; place-items: center; border: 2px solid; border-radius: 50%; font-size: .8rem; font-weight: 800; }
+.legend-warning.delayed { border-color: #b54708; color: #7a2e0e; background: #fff0c2; }
+.legend-warning.blocked { border-color: #a00050; border-style: dashed; color: #79003d; background: #ffe4ef; }
 .map-frame { overflow: auto; border: 1px solid #cbd5e1; border-radius: .5rem; background: #f8fafc; }
 #city-map { display: block; width: 100%; min-width: 650px; height: auto; }
 .pathway { fill: none; stroke-linecap: round; }
 .pathway-road { stroke: #697586; stroke-width: 2.5; }
 .pathway-pavement { stroke: #55657a; stroke-width: 2.3; stroke-dasharray: 2 6; }
 .pathway-train { stroke: #9a5700; stroke-width: 4; stroke-dasharray: 9 6; }
-.pathway-delayed { stroke: #b54708; stroke-dasharray: 6 5; }
-.pathway-blocked { stroke: #b42318; stroke-width: 5; stroke-dasharray: 3 4; }
+.pathway-delayed { stroke: #e65100; stroke-width: 4; stroke-dasharray: 8 4; }
+.pathway-blocked { stroke: #c00050; stroke-width: 5; stroke-dasharray: 3 4; }
 .pathway-hit-area { fill: none; stroke: transparent; stroke-width: 12; pointer-events: stroke; cursor: pointer; }
 .pathway-hit-area:focus-visible { stroke: rgb(245 158 11 / 35%); outline: none; }
-.obstruction-marker { fill: #fff4e5; stroke: #b54708; stroke-width: 2; pointer-events: none; }
+/* Warning markers use separate high-contrast shapes so routes stay distinguishable. */
+.obstruction-marker { fill: #fff0c2; stroke: #b54708; stroke-width: 2.5; pointer-events: none; }
+.obstruction-marker.obstruction-blocked { fill: #ffe4ef; stroke: #a00050; stroke-dasharray: 3 2; }
 .obstruction-label { fill: #7a2e0e; font-size: 15px; font-weight: 800; text-anchor: middle; pointer-events: none; }
+.obstruction-label.obstruction-blocked { fill: #79003d; }
 .route-segment { fill: none; stroke: #b42318; stroke-width: 7; stroke-linecap: round; pointer-events: none; }
 .map-node { fill: #334155; stroke: #fff; stroke-width: 2; pointer-events: none; }
 .map-node.station { fill: #174ea6; }
