@@ -359,6 +359,7 @@ class WebApiTests(unittest.TestCase):
                 for leg in result.route.legs
             )
         )
+        self.assertIn("user-placed blockage", result.route.explanation)
 
     def test_route_response_includes_timing_and_map_segments(self) -> None:
         response = calculate_routes(
@@ -377,6 +378,55 @@ class WebApiTests(unittest.TestCase):
         self.assertGreater(route.duration_minutes, 0)
         self.assertTrue(route.legs)
         self.assertTrue(all(leg.pathway == "pavement" for leg in route.legs))
+        self.assertTrue(route.explanation)
+        self.assertLessEqual(len(route.explanation.split(". ")), 3)
+
+    def test_route_explanations_use_preferences_and_trip_conditions(self) -> None:
+        toll_avoiding = calculate_routes(
+            TripRequest(
+                start="Harbor Station",
+                destination="Airport Station",
+                time=datetime(2026, 6, 15, 12, 0),
+                mode="driving",
+                avoid_tolls=True,
+            )
+        )
+        self.assertTrue(
+            all("avoid toll roads" in route.explanation for route in toll_avoiding.routes)
+        )
+
+        rush_hour = calculate_routes(
+            TripRequest(
+                start="West End",
+                destination="City Hospital",
+                time=datetime(2026, 6, 15, 8, 0),
+                mode="driving",
+            )
+        )
+        self.assertTrue(
+            any("rush-hour traffic" in route.explanation for route in rush_hour.routes)
+        )
+
+        direct_train = calculate_routes(
+            TripRequest(
+                start="Central Station",
+                destination="Airport Station",
+                time=datetime(2026, 6, 15, 8, 0),
+                mode="transit",
+            )
+        )
+        self.assertIn("direct Central Line train corridor", direct_train.routes[0].explanation)
+
+        limited = calculate_routes(
+            TripRequest(
+                start="Old Town",
+                destination="Central Station",
+                time=datetime(2026, 6, 15, 10, 0),
+                mode="walking",
+                limit=1,
+            )
+        )
+        self.assertNotIn("only valid path", limited.routes[0].explanation)
 
     def test_manual_pathway_state_cycles_and_changes_route_calculation(self) -> None:
         """Map state is returned by the API and a blocked edge is avoided."""
@@ -408,6 +458,7 @@ class WebApiTests(unittest.TestCase):
         self.assertFalse(
             any(leg.start == "Old Town" and leg.end == "Market Square" for leg in route.legs)
         )
+        self.assertIn("user-placed blockage", route.explanation)
 
         update_manual_obstruction(
             ManualObstructionRequest(

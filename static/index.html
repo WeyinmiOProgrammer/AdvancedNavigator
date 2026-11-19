@@ -98,17 +98,26 @@
           <li><span class="legend-warning blocked" aria-hidden="true">×</span>Blockage warning</li>
         </ul>
       </div>
-      <div class="map-frame">
+      <div class="map-frame" tabindex="0" aria-label="Interactive city map. Use plus and minus to zoom.">
+        <div class="map-viewport-controls" role="group" aria-label="Map viewport controls">
+          <button id="map-zoom-out" type="button" aria-label="Zoom out" title="Zoom out">-</button>
+          <button id="map-reset-view" type="button" aria-label="Reset view" title="Reset view">=</button>
+          <button id="map-zoom-in" type="button" aria-label="Zoom in" title="Zoom in">+</button>
+          
+          
+        </div>
         <svg id="city-map" viewBox="0 0 1000 850" role="img"
              aria-label="Map of city locations and roads, pavements, and train lines">
           <title>City pathway map</title>
           <desc>Choose a route to highlight its path between locations.</desc>
-          <g id="pathways"></g>
-          <g id="selected-route"></g>
-          <g id="map-locations"></g>
-          <g id="simulation-marker"></g>
-          <!-- Obstruction symbols stay above routes, nodes, and the moving marker. -->
-          <g id="map-obstructions"></g>
+          <g id="map-viewport">
+            <g id="pathways"></g>
+            <g id="selected-route"></g>
+            <g id="map-locations"></g>
+            <g id="simulation-marker"></g>
+            <!-- Obstruction symbols stay above routes, nodes, and the moving marker. -->
+            <g id="map-obstructions"></g>
+          </g>
         </svg>
       </div>
     </section>

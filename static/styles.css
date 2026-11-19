@@ -76,8 +76,33 @@ input, select, button { font: inherit; }
 .legend-warning { display: inline-grid; width: 1.15rem; height: 1.15rem; place-items: center; border: 2px solid; border-radius: 50%; font-size: .8rem; font-weight: 800; }
 .legend-warning.delayed { border-color: #b54708; color: #7a2e0e; background: #fff0c2; }
 .legend-warning.blocked { border-color: #a00050; border-style: dashed; color: #79003d; background: #ffe4ef; }
-.map-frame { overflow: auto; border: 1px solid #cbd5e1; border-radius: .5rem; background: #f8fafc; }
+.map-frame { position: relative; overflow: auto; border: 1px solid #cbd5e1; border-radius: .5rem; background: #f8fafc; }
+.map-viewport-controls {
+  position: absolute;
+  z-index: 2;
+  top: .75rem;
+  right: .75rem;
+  display: flex;
+  gap: .4rem;
+}
+.map-viewport-controls button {
+  width: 2.75rem;
+  height: 2.75rem;
+  border: 1px solid #64748b;
+  border-radius: .4rem;
+  color: #fff;
+  background: #12305a;
+  box-shadow: 0 2px 6px rgb(23 32 51 / 25%);
+  font-size: 1.25rem;
+  font-weight: 800;
+  cursor: pointer;
+}
+.map-viewport-controls button:hover { background: #174ea6; }
 #city-map { display: block; width: 100%; min-width: 650px; height: auto; }
+#city-map { touch-action: none; }
+.map-frame:focus-visible { outline: 3px solid #f59e0b; outline-offset: 3px; }
+.map-frame.is-zoomed #city-map { cursor: grab; }
+.map-frame.is-zoomed #city-map:active { cursor: grabbing; }
 .pathway { fill: none; stroke-linecap: round; }
 .pathway-road { stroke: #697586; stroke-width: 2.5; }
 .pathway-pavement { stroke: #55657a; stroke-width: 2.3; stroke-dasharray: 2 6; }
@@ -100,6 +125,7 @@ input, select, button { font: inherit; }
 .journey-marker-core { fill: #172033; pointer-events: none; }
 .route-list { display: grid; grid-template-columns: repeat(auto-fit, minmax(min(100%, 260px), 1fr)); gap: .8rem; }
 .route-card {
+  position: relative;
   width: 100%;
   min-height: 8rem;
   padding: 1rem;
@@ -107,13 +133,66 @@ input, select, button { font: inherit; }
   border-radius: .5rem;
   color: inherit;
   background: #fff;
+}
+.route-card.is-selected { border-color: #174ea6; background: #eef5ff; box-shadow: inset 0 0 0 1px #174ea6; }
+.route-card:hover { border-color: #174ea6; }
+.route-select {
+  display: block;
+  width: 100%;
+  min-height: 6rem;
+  padding: .5rem .1rem 0;
+  border: 0;
+  color: inherit;
+  background: transparent;
   text-align: left;
   cursor: pointer;
 }
-.route-card:hover { border-color: #174ea6; }
-.route-card[aria-pressed="true"] { border-color: #174ea6; background: #eef5ff; box-shadow: inset 0 0 0 1px #174ea6; }
-.route-card strong { display: block; margin-bottom: .35rem; font-size: 1.1rem; }
-.route-card span { display: block; margin-top: .3rem; color: #334155; }
+.route-select[aria-pressed="true"] { color: #12305a; }
+.route-select strong { display: block; margin-bottom: .35rem; font-size: 1.1rem; }
+.route-select span { display: block; margin-top: .3rem; color: #334155; }
+.route-explanation-trigger {
+  position: absolute;
+  top: .55rem;
+  right: .55rem;
+  width: 2rem;
+  height: 2rem;
+  border: 1px solid #174ea6;
+  border-radius: 50%;
+  color: #12305a;
+  background: #fff;
+  font-weight: 800;
+  cursor: pointer;
+}
+.route-explanation {
+  position: absolute;
+  z-index: 5;
+  bottom: calc(100% + .65rem);
+  left: 50%;
+  width: min(20rem, calc(100vw - 3rem));
+  padding: .9rem 1rem;
+  transform: translateX(-50%);
+  border: 1px solid #12305a;
+  border-radius: .5rem;
+  color: #fff;
+  background: #12305a;
+  box-shadow: 0 6px 18px rgb(23 32 51 / 25%);
+}
+.route-explanation[hidden] { display: none; }
+.route-explanation h3 { margin: 0 2rem .4rem 0; font-size: 1rem; }
+.route-explanation p { margin: 0; line-height: 1.45; }
+.route-explanation-close {
+  position: absolute;
+  top: .4rem;
+  right: .4rem;
+  width: 2rem;
+  height: 2rem;
+  border: 1px solid #fff;
+  border-radius: .3rem;
+  color: #fff;
+  background: transparent;
+  font-size: 1.2rem;
+  cursor: pointer;
+}
 .simulation-panel, .testing-panel {
   margin-bottom: 1.5rem;
   padding: clamp(1rem, 3vw, 1.5rem);

@@ -4,6 +4,8 @@ const routeList = document.querySelector("#route-list");
 const routeHint = document.querySelector("#route-hint");
 const datalist = document.querySelector("#location-options");
 const svg = document.querySelector("#city-map");
+const mapFrame = document.querySelector(".map-frame");
+const mapViewport = document.querySelector("#map-viewport");
 const pathwaysGroup = document.querySelector("#pathways");
 const obstructionsGroup = document.querySelector("#map-obstructions");
 const selectedRouteGroup = document.querySelector("#selected-route");
@@ -42,6 +44,12 @@ let routeRefreshTimer = null;
 let routeRefreshGeneration = 0;
 let routeRefreshInFlight = false;
 let routeRefreshPending = false;
+let mapScale = 1;
+let mapTranslateX = 0;
+let mapTranslateY = 0;
+let mapPointer = null;
+let suppressMapClick = false;
+let activeExplanation = null;
 submitButton.disabled = true;
 startSimulationButton.disabled = true;
 
@@ -84,6 +92,114 @@ function svgElement(name, attributes = {}) {
 function pathwayKey(start, end, pathway) {
   return [start, end].sort().concat(pathway).join("|");
 }
+
+// Transform the complete map together, and convert screen positions back to SVG
+// coordinates so zoom anchors and drag offsets remain accurate at every scale.
+function svgPointFromClient(clientX, clientY) {
+  const point = svg.createSVGPoint();
+  point.x = clientX;
+  point.y = clientY;
+  return point.matrixTransform(svg.getScreenCTM().inverse());
+}
+
+function applyMapViewport() {
+  if (mapScale === 1) {
+    mapTranslateX = 0;
+    mapTranslateY = 0;
+    mapViewport.removeAttribute("transform");
+    mapFrame.classList.remove("is-zoomed");
+    return;
+  }
+  mapViewport.setAttribute(
+    "transform",
+    `translate(${mapTranslateX} ${mapTranslateY}) scale(${mapScale})`,
+  );
+  mapFrame.classList.add("is-zoomed");
+}
+
+function zoomMap(factor, anchor = { x: 500, y: 425 }) {
+  const nextScale = Math.min(5, Math.max(1, mapScale * factor));
+  if (nextScale === mapScale) return;
+  const scaleRatio = nextScale / mapScale;
+  mapTranslateX = anchor.x - (anchor.x - mapTranslateX) * scaleRatio;
+  mapTranslateY = anchor.y - (anchor.y - mapTranslateY) * scaleRatio;
+  mapScale = nextScale;
+  applyMapViewport();
+}
+
+function resetMapViewport() {
+  mapScale = 1;
+  mapTranslateX = 0;
+  mapTranslateY = 0;
+  applyMapViewport();
+}
+
+mapFrame.addEventListener("wheel", (event) => {
+  if (!svg.contains(event.target)) return;
+  event.preventDefault();
+  zoomMap(event.deltaY < 0 ? 1.15 : 1 / 1.15, svgPointFromClient(event.clientX, event.clientY));
+}, { passive: false });
+
+mapFrame.addEventListener("keydown", (event) => {
+  if (event.target.closest("button")) return;
+  if (event.key === "+" || event.key === "-") {
+    event.preventDefault();
+    zoomMap(event.key === "+" ? 1.2 : 1 / 1.2);
+  } else if (event.key === "=") {
+    event.preventDefault();
+    resetMapViewport();
+  }
+});
+
+mapFrame.addEventListener("pointerdown", (event) => {
+  if (!svg.contains(event.target) || !event.isPrimary || event.button !== 0) return;
+  mapPointer = {
+    pointerId: event.pointerId,
+    clientX: event.clientX,
+    clientY: event.clientY,
+    startPoint: svgPointFromClient(event.clientX, event.clientY),
+    startTranslateX: mapTranslateX,
+    startTranslateY: mapTranslateY,
+    dragging: false,
+  };
+});
+
+window.addEventListener("pointermove", (event) => {
+  if (!mapPointer || event.pointerId !== mapPointer.pointerId) return;
+  const distance = Math.hypot(
+    event.clientX - mapPointer.clientX,
+    event.clientY - mapPointer.clientY,
+  );
+  if (!mapPointer.dragging && distance > 5) {
+    mapPointer.dragging = true;
+    suppressMapClick = true;
+  }
+  if (!mapPointer.dragging || mapScale === 1) return;
+  event.preventDefault();
+  const point = svgPointFromClient(event.clientX, event.clientY);
+  mapTranslateX = mapPointer.startTranslateX
+    + (point.x - mapPointer.startPoint.x) / mapScale;
+  mapTranslateY = mapPointer.startTranslateY
+    + (point.y - mapPointer.startPoint.y) / mapScale;
+  applyMapViewport();
+});
+
+window.addEventListener("pointerup", (event) => {
+  if (!mapPointer || event.pointerId !== mapPointer.pointerId) return;
+  mapPointer = null;
+  if (suppressMapClick) window.setTimeout(() => { suppressMapClick = false; }, 0);
+});
+
+svg.addEventListener("click", (event) => {
+  if (!suppressMapClick) return;
+  event.preventDefault();
+  event.stopPropagation();
+  suppressMapClick = false;
+}, true);
+
+document.querySelector("#map-zoom-in").addEventListener("click", () => zoomMap(1.25));
+document.querySelector("#map-zoom-out").addEventListener("click", () => zoomMap(1 / 1.25));
+document.querySelector("#map-reset-view").addEventListener("click", resetMapViewport);
 
 // Populate the map, location picker, and editable pathway state from the city API.
 function renderCity(graph) {
@@ -268,7 +384,9 @@ function highlightRoute(route) {
     }).filter(Boolean);
   selectedRouteGroup.replaceChildren(...makeRouteLines(route), ...markers);
   routeList.querySelectorAll(".route-card").forEach((card) => {
-    card.setAttribute("aria-pressed", String(Number(card.dataset.routeId) === route.id));
+    const isSelected = Number(card.dataset.routeId) === route.id;
+    card.classList.toggle("is-selected", isSelected);
+    card.querySelector(".route-select").setAttribute("aria-pressed", String(isSelected));
   });
   svg.setAttribute("aria-label", `City map with selected route: ${route.locations.join(" to ")}`);
 }
@@ -287,16 +405,55 @@ function routeDuration(route) {
   ));
 }
 
+function closeRouteExplanation(restoreFocus = false) {
+  if (!activeExplanation) return;
+  const { trigger, tooltip } = activeExplanation;
+  trigger.setAttribute("aria-expanded", "false");
+  tooltip.hidden = true;
+  activeExplanation = null;
+  if (restoreFocus) trigger.focus();
+}
+
+function openRouteExplanation(trigger, tooltip) {
+  if (activeExplanation && activeExplanation.trigger === trigger) {
+    closeRouteExplanation(true);
+    return;
+  }
+  closeRouteExplanation();
+  trigger.setAttribute("aria-expanded", "true");
+  tooltip.hidden = false;
+  activeExplanation = { trigger, tooltip };
+  tooltip.querySelector(".route-explanation-close").focus();
+}
+
+document.addEventListener("click", (event) => {
+  if (!activeExplanation) return;
+  if (activeExplanation.tooltip.contains(event.target)
+    || activeExplanation.trigger.contains(event.target)) return;
+  closeRouteExplanation();
+});
+
+document.addEventListener("keydown", (event) => {
+  if (event.key === "Escape" && activeExplanation) {
+    event.preventDefault();
+    closeRouteExplanation(true);
+  }
+});
+
 // Rebuild route cards and keep the prior route index when it is still available.
 function showRoutes(routes, preferredRouteId = null) {
+  closeRouteExplanation();
   routeList.replaceChildren();
   routes.forEach((route) => {
-    const card = document.createElement("button");
-    card.type = "button";
+    const card = document.createElement("article");
     card.className = "route-card";
     card.dataset.routeId = String(route.id);
-    card.setAttribute("aria-pressed", "false");
-    card.setAttribute("aria-label",
+    const selectButton = document.createElement("button");
+    selectButton.type = "button";
+    selectButton.className = "route-select";
+    selectButton.dataset.routeId = String(route.id);
+    selectButton.setAttribute("aria-pressed", "false");
+    selectButton.setAttribute("aria-label",
       `Route ${route.id}: ${route.summary}, ${route.duration_minutes} minutes`);
 
     const title = document.createElement("strong");
@@ -305,8 +462,38 @@ function showRoutes(routes, preferredRouteId = null) {
     summary.textContent = `Via ${route.summary} · ${route.distance_km.toFixed(1)} km`;
     const times = document.createElement("span");
     times.textContent = `${formatTime(route.departure)} – ${formatTime(route.arrival)}`;
-    card.append(title, summary, times);
-    card.addEventListener("click", () => selectRoute(route));
+    selectButton.append(title, summary, times);
+    selectButton.addEventListener("click", () => selectRoute(route));
+
+    const trigger = document.createElement("button");
+    trigger.type = "button";
+    trigger.className = "route-explanation-trigger";
+    trigger.textContent = "?";
+    trigger.setAttribute("aria-label", "Explain why this route was chosen");
+    trigger.setAttribute("aria-expanded", "false");
+    trigger.title = "Explain why this route was chosen";
+
+    const tooltip = document.createElement("div");
+    tooltip.id = `route-explanation-${route.id}`;
+    tooltip.className = "route-explanation";
+    tooltip.setAttribute("role", "dialog");
+    tooltip.setAttribute("aria-label", "Why this route?");
+    tooltip.hidden = true;
+    trigger.setAttribute("aria-controls", tooltip.id);
+    const explanationTitle = document.createElement("h3");
+    explanationTitle.textContent = "Why this route?";
+    const explanation = document.createElement("p");
+    explanation.textContent = route.explanation;
+    const closeButton = document.createElement("button");
+    closeButton.type = "button";
+    closeButton.className = "route-explanation-close";
+    closeButton.textContent = "×";
+    closeButton.setAttribute("aria-label", "Close route explanation");
+    closeButton.title = "Close route explanation";
+    closeButton.addEventListener("click", () => closeRouteExplanation(true));
+    tooltip.append(explanationTitle, explanation, closeButton);
+    trigger.addEventListener("click", () => openRouteExplanation(trigger, tooltip));
+    card.append(selectButton, trigger, tooltip);
     routeList.append(card);
   });
   routeHint.textContent = `${routes.length} route option${routes.length === 1 ? "" : "s"} found.`;
@@ -776,6 +963,7 @@ async function refreshRoutesAutomatically(generation) {
 
 // Remove stale route choices and announce why no current route can be shown.
 function clearRouteResults(message) {
+  closeRouteExplanation();
   selectedRoute = null;
   resetSimulation();
   routeList.replaceChildren();
@@ -804,6 +992,7 @@ form.addEventListener("submit", async (event) => {
   resetSimulation();
   selectedRoute = null;
   startSimulationButton.disabled = true;
+  closeRouteExplanation();
   routeList.replaceChildren();
   selectedRouteGroup.replaceChildren();
   obstructionsGroup.replaceChildren();

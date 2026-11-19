@@ -913,6 +913,7 @@ class RouteResponse(BaseModel):
     duration_minutes: int
     distance_km: float
     summary: str
+    explanation: str
 
 
 class RoutesResponse(BaseModel):
@@ -1059,7 +1060,84 @@ def update_manual_obstruction(
     )
 
 
-def _route_response(route: Route, route_id: int) -> RouteResponse:
+def _route_explanation(
+    route: Route,
+    mode: TravelMode,
+    preferences: Preferences,
+    route_rank: int,
+    route_count: int,
+    obstructions: tuple[Obstruction, ...],
+) -> str:
+    """Explain a route using its traversed edges and the trip's active conditions."""
+    route_edges = {
+        (frozenset((leg.edge.start, leg.edge.end)), leg.edge.pathway)
+        for leg in route.legs
+    }
+    relevant_times = (route.departure, *(leg.departure for leg in route.legs))
+
+    # Build reasons from actual restrictions and traversals, not assumptions
+    # based only on the route's name or its position in the result list.
+    reasons: list[str] = []
+    for obstruction in obstructions:
+        edge_key = (frozenset((obstruction.start, obstruction.end)), obstruction.pathway)
+        if edge_key in route_edges:
+            continue
+        if not {obstruction.start, obstruction.end}.issubset(route.locations):
+            continue
+        edge = next(
+            (
+                item
+                for item in city.adjacency.get(obstruction.start, [])
+                if item.end == obstruction.end
+                and item.pathway is obstruction.pathway
+            ),
+            None,
+        )
+        if edge is None or not any(
+            obstruction.is_active(edge, at, mode) for at in relevant_times
+        ):
+            continue
+        if obstruction not in city.SCHEDULED_OBSTRUCTIONS:
+            condition = "user-placed blockage" if obstruction.blocked else "user-placed delay"
+            reasons.append(f"It avoids a {condition} on {obstruction.name}.")
+        else:
+            reasons.append(
+                f"It bypasses the scheduled {obstruction.reason.lower()} on {obstruction.name}."
+            )
+        break
+
+    if preferences.avoid_tolls and mode is TravelMode.DRIVING:
+        reasons.append("It honors your preference to avoid toll roads.")
+    else:
+        toll_edges = [leg.edge for leg in route.legs if leg.edge.toll]
+        if toll_edges:
+            reasons.append(f"It uses the toll road {toll_edges[0].name}.")
+
+    train_lines = list(dict.fromkeys(
+        leg.edge.train_line for leg in route.legs
+        if leg.edge.pathway is Pathway.TRAIN and leg.edge.train_line
+    ))
+    if train_lines and all(leg.edge.pathway is Pathway.TRAIN for leg in route.legs):
+        reasons.append(f"It follows the direct {train_lines[0]} train corridor.")
+    elif train_lines:
+        reasons.append(f"It includes rail travel on {', '.join(train_lines)}.")
+
+    if route_count == 1:
+        recommendation = "This is the only valid path for the requested locations and settings."
+    elif route_rank == 1:
+        recommendation = (
+            f"This is the recommended {preferences.priority} option for your settings."
+        )
+    else:
+        recommendation = (
+            f"This is an alternative route, ranked by {preferences.priority} for your settings."
+        )
+    return " ".join((recommendation, *reasons[:2]))
+
+
+def _route_response(
+    route: Route, route_id: int, explanation: str
+) -> RouteResponse:
     """Adapt one simulator route to its stable browser representation."""
     return RouteResponse(
         id=route_id,
@@ -1081,6 +1159,7 @@ def _route_response(route: Route, route_id: int) -> RouteResponse:
         duration_minutes=math.ceil(route.duration.total_seconds() / 60),
         distance_km=route.distance_km,
         summary=route.summary(),
+        explanation=explanation,
     )
 
 
@@ -1131,9 +1210,25 @@ def calculate_routes(request: TripRequest) -> RoutesResponse:
 
     # Each response leg preserves its graph endpoints, so the selected card can
     # identify and highlight the matching lines without another server request.
+    active_obstructions = (
+        *manual_obstructions.values(),
+        *city.SCHEDULED_OBSTRUCTIONS,
+    )
+    explanation_route_count = len(routes) if request.limit > 1 else 2
     return RoutesResponse(
         routes=[
-            _route_response(route, index)
+            _route_response(
+                route,
+                index,
+                _route_explanation(
+                    route,
+                    mode,
+                    preferences,
+                    index,
+                    explanation_route_count,
+                    active_obstructions,
+                ),
+            )
             for index, route in enumerate(routes, start=1)
         ]
     )
@@ -1302,7 +1397,18 @@ def calculate_reroute(request: RerouteRequest) -> RerouteResponse:
         approach_end_x=switch_location.x,
         approach_end_y=switch_location.y,
         reason=incident.reason if incident else "The pathway obstruction was cleared",
-        route=_route_response(route, 1),
+        route=_route_response(
+            route,
+            1,
+            _route_explanation(
+                route,
+                mode,
+                preferences,
+                1,
+                2,
+                (*obstructions, *city.SCHEDULED_OBSTRUCTIONS),
+            ),
+        ),
     )
 
 
