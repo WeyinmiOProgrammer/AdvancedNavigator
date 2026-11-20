@@ -19,9 +19,13 @@ from app import (
     TripRequest,
     calculate_routes,
     calculate_reroute,
+    evaluate_weather_risk,
     get_city,
+    get_schedule,
+    get_weather,
     manual_obstructions,
     render_svg,
+    simulate_weather,
     update_manual_obstruction,
 )
 
@@ -140,6 +144,62 @@ class CityMapTests(unittest.TestCase):
         rush = self.city._leg_for(road, datetime(2026, 6, 15, 8, 0))
         midday = self.city._leg_for(road, datetime(2026, 6, 15, 12, 0))
         self.assertGreater(rush.arrival - rush.departure, midday.arrival - midday.departure)
+
+    def test_weather_forecast_is_repeatable_and_risk_matches_pathway_vulnerability(self) -> None:
+        """Date-driven forecasts are stable and each weather hazard has a pathway policy."""
+        winter_evening = datetime(2026, 1, 15, 20, 0)
+        self.assertEqual(
+            simulate_weather(winter_evening),
+            simulate_weather(winter_evening),
+        )
+        self.assertEqual(simulate_weather(winter_evening, "snow").condition, "snow")
+        winter_conditions = {
+            simulate_weather(datetime(2026, 1, day, 9)).condition
+            for day in range(1, 29)
+        }
+        summer_conditions = {
+            simulate_weather(datetime(2026, 7, day, 9)).condition
+            for day in range(1, 29)
+        }
+        self.assertIn("snow", winter_conditions)
+        self.assertNotIn("snow", summer_conditions)
+        exposed_road = next(
+            edge
+            for edge in self.city.adjacency["Old Town"]
+            if edge.end == "Southbank" and edge.pathway is Pathway.ROAD
+        )
+        train = next(
+            edge
+            for edge in self.city.adjacency["Central Station"]
+            if edge.end == "Riverside Station" and edge.pathway is Pathway.TRAIN
+        )
+        vulnerable_path = next(
+            edge
+            for edge in self.city.adjacency["Botanical Gardens"]
+            if edge.end == "Hilltop" and edge.pathway is Pathway.PAVEMENT
+        )
+        self.assertEqual(evaluate_weather_risk(exposed_road, "storm").level, "high")
+        self.assertEqual(evaluate_weather_risk(train, "wind").level, "moderate")
+        self.assertEqual(evaluate_weather_risk(vulnerable_path, "snow").level, "high")
+        self.assertIsNone(evaluate_weather_risk(exposed_road, "sun"))
+
+    def test_weather_routing_applies_delay_penalties_and_avoids_storm_hazards(self) -> None:
+        """Weather-aware routing adds time for rain and avoids high-risk edges."""
+        when = datetime(2026, 6, 15, 12, 0)
+        clear_route = self.city.find_routes(
+            "Old Town", "Southbank", when, TravelMode.DRIVING,
+            weather_override="sun", limit=1,
+        )[0]
+        rainy_route = self.city.find_routes(
+            "Old Town", "Southbank", when, TravelMode.DRIVING,
+            limit=1, weather_override="rain", consider_weather=True,
+        )[0]
+        storm_route = self.city.find_routes(
+            "Old Town", "Southbank", when, TravelMode.DRIVING,
+            limit=1, weather_override="storm", consider_weather=True,
+        )[0]
+        self.assertGreater(rainy_route.duration, clear_route.duration)
+        self.assertNotIn("Old Bridge", storm_route.summary())
 
     def test_scheduled_weekday_delay_changes_the_initial_route(self) -> None:
         """A scheduled rush-hour penalty makes a faster detour preferable."""
@@ -427,6 +487,60 @@ class WebApiTests(unittest.TestCase):
             )
         )
         self.assertNotIn("only valid path", limited.routes[0].explanation)
+
+    def test_weather_risks_and_route_explanations_follow_user_setting(self) -> None:
+        forecast = get_weather(datetime(2026, 6, 15, 12, 0), "storm")
+        self.assertEqual(forecast.condition, "storm")
+        self.assertTrue(any(item.level == "high" for item in forecast.risk_edges))
+
+        ignored = calculate_routes(
+            TripRequest(
+                start="Old Town",
+                destination="Southbank",
+                time=datetime(2026, 6, 15, 12, 0),
+                mode="driving",
+                weather_override="storm",
+                consider_weather=False,
+            )
+        )
+        aware = calculate_routes(
+            TripRequest(
+                start="Old Town",
+                destination="Southbank",
+                time=datetime(2026, 6, 15, 12, 0),
+                mode="driving",
+                weather_override="storm",
+                consider_weather=True,
+            )
+        )
+        self.assertIn("weather risks were ignored", ignored.routes[0].explanation)
+        self.assertNotIn("Old Bridge", aware.routes[0].summary)
+        self.assertIn("predicted weather obstruction", aware.routes[0].explanation)
+
+    def test_schedule_reference_is_derived_from_service_rules(self) -> None:
+        schedule = get_schedule()
+        self.assertEqual(len(schedule["weekly_public_transport"]), 2)
+        self.assertEqual(len(schedule["weekly_traffic"]), 2)
+        self.assertEqual(len(schedule["annual_maintenance"]), len(CityMap.ANNUAL_MAINTENANCE))
+        annual = schedule["annual_maintenance"][0]
+        self.assertEqual(annual["starts_on"], "2026-07-06")
+        self.assertTrue(any(item.starts_on and item.ends_on for item in get_city().obstructions))
+        maintenance = CityMap.ANNUAL_MAINTENANCE[0]
+        campus_road = next(
+            edge
+            for edge in CityMap().adjacency["University"]
+            if edge.end == "City Hospital" and edge.pathway is Pathway.ROAD
+        )
+        self.assertTrue(
+            maintenance.is_active(
+                campus_road, datetime(2026, 7, 6, 10, 0), TravelMode.DRIVING
+            )
+        )
+        self.assertFalse(
+            maintenance.is_active(
+                campus_road, datetime(2026, 7, 11, 10, 0), TravelMode.DRIVING
+            )
+        )
 
     def test_manual_pathway_state_cycles_and_changes_route_calculation(self) -> None:
         """Map state is returned by the API and a blocked edge is avoided."""

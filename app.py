@@ -14,7 +14,7 @@ import html
 import itertools
 import math
 from dataclasses import dataclass
-from datetime import datetime, timedelta
+from datetime import date, datetime, timedelta
 from enum import Enum
 from pathlib import Path
 from typing import Literal, Optional
@@ -104,6 +104,8 @@ class Obstruction:
     weekdays: tuple[int, ...] = ()
     start_minute: int = 0
     end_minute: int = 24 * 60
+    starts_on: Optional[date] = None
+    ends_on: Optional[date] = None
 
     def is_active(self, edge: Edge, at: datetime, mode: TravelMode) -> bool:
         """Match an edge in either direction and its scheduled local-time window."""
@@ -113,11 +115,126 @@ class Obstruction:
             or mode not in self.modes
         ):
             return False
+        if self.starts_on and at.date() < self.starts_on:
+            return False
+        if self.ends_on and at.date() > self.ends_on:
+            return False
         minute = at.hour * 60 + at.minute
         return (
             (not self.weekdays or at.weekday() in self.weekdays)
             and self.start_minute <= minute < self.end_minute
         )
+
+
+@dataclass(frozen=True)
+class WeatherForecast:
+    """A repeatable forecast for one selected local trip time."""
+
+    condition: str
+    label: str
+    description: str
+
+
+@dataclass(frozen=True)
+class WeatherRisk:
+    """A predicted weather impact on one pathway."""
+
+    level: Literal["moderate", "high"]
+    reason: str
+    speed_factor: float
+
+
+WEATHER_OPTIONS = ("auto", "sun", "rain", "wind", "storm", "snow")
+WEATHER_LABELS = {
+    "sun": "Clear / sunny",
+    "rain": "Rain",
+    "wind": "High winds",
+    "storm": "Storm",
+    "snow": "Snow",
+}
+WEATHER_DESCRIPTIONS = {
+    "sun": "Dry conditions with no predicted weather-related pathway risks.",
+    "rain": "Wet road surfaces may slow exposed road travel.",
+    "wind": "Wind exposure may delay elevated bridges and rail lines.",
+    "storm": "Severe weather may obstruct exposed roads and rail corridors.",
+    "snow": "Snow may obstruct vulnerable roads and walking paths.",
+}
+
+
+def simulate_weather(at: datetime, override: str = "auto") -> WeatherForecast:
+    """Choose deterministic weather from the trip's date, time slot, and season.
+
+    Seasonal probability bands create plausible variation while ordinal-date
+    arithmetic keeps the same trip input reproducible across requests and runs.
+    """
+    if override not in WEATHER_OPTIONS:
+        raise ValueError(f"Unknown weather override: {override}")
+    if override != "auto":
+        condition = override
+    else:
+        season = (
+            "winter" if at.month in (12, 1, 2)
+            else "spring" if at.month in (3, 4, 5)
+            else "summer" if at.month in (6, 7, 8)
+            else "autumn"
+        )
+        bands = {
+            "winter": (("snow", 30), ("sun", 25), ("rain", 20), ("wind", 15), ("storm", 10)),
+            "spring": (("sun", 40), ("rain", 30), ("wind", 16), ("storm", 14)),
+            "summer": (("sun", 54), ("rain", 20), ("wind", 10), ("storm", 16)),
+            "autumn": (("sun", 34), ("rain", 30), ("wind", 23), ("storm", 13)),
+        }
+        # A six-hour slot lets a forecast change during the day without random state.
+        sample = (at.toordinal() * 37 + (at.hour // 6) * 29 + at.year * 13) % 100
+        cumulative = 0
+        condition = "sun"
+        for candidate, probability in bands[season]:
+            cumulative += probability
+            if sample < cumulative:
+                condition = candidate
+                break
+    return WeatherForecast(
+        condition,
+        WEATHER_LABELS[condition],
+        WEATHER_DESCRIPTIONS[condition],
+    )
+
+
+def evaluate_weather_risk(edge: Edge, condition: str) -> Optional[WeatherRisk]:
+    """Map weather to pathway-specific delay or closure risk and its cost.
+
+    Only exposed roadways, bridges, rail lines, and snowy walking links receive
+    predicted risk; confirmed obstructions remain a separate routing input.
+    """
+    name = edge.name.casefold()
+    exposed = edge.highway or any(
+        landmark in name for landmark in ("bridge", "river", "riverside", "ridge", "outer ring")
+    )
+    # Severe hazards close only the vulnerable links; lesser exposure adds time.
+    if condition == "rain" and edge.pathway is Pathway.ROAD and exposed:
+        return WeatherRisk("moderate", "rain-slick road", 1.5)
+    if condition == "wind" and (
+        edge.pathway is Pathway.TRAIN
+        or (edge.pathway is Pathway.ROAD and "bridge" in name)
+    ):
+        return WeatherRisk("moderate", "high-wind exposure", 1.4)
+    if condition == "storm":
+        if edge.pathway is Pathway.TRAIN or (
+            edge.pathway is Pathway.ROAD
+            and (edge.highway or "bridge" in name)
+        ):
+            return WeatherRisk("high", "storm exposure", 1.0)
+        if edge.pathway is Pathway.ROAD:
+            return WeatherRisk("moderate", "storm-related road delays", 1.6)
+    if condition == "snow":
+        vulnerable_path = edge.pathway is Pathway.PAVEMENT and any(
+            landmark in name for landmark in ("trail", "path", "steps", "garden")
+        )
+        if vulnerable_path or (edge.pathway is Pathway.ROAD and edge.highway):
+            return WeatherRisk("high", "snow and ice exposure", 1.0)
+        if edge.pathway in (Pathway.ROAD, Pathway.TRAIN, Pathway.PAVEMENT):
+            return WeatherRisk("moderate", "snow-related delays", 1.4)
+    return None
 
 
 @dataclass(frozen=True)
@@ -206,6 +323,43 @@ class CityMap:
             18 * 60,
         ),
     )
+    ANNUAL_MAINTENANCE = (
+        Obstruction(
+            "University",
+            "City Hospital",
+            Pathway.ROAD,
+            "Campus Road",
+            "Annual road maintenance",
+            (TravelMode.DRIVING,),
+            True,
+            1.0,
+            (),
+            9 * 60,
+            16 * 60,
+            date(2026, 7, 6),
+            date(2026, 7, 10),
+        ),
+        Obstruction(
+            "Central Station",
+            "Riverside Station",
+            Pathway.TRAIN,
+            "Central Line",
+            "Annual rail maintenance",
+            (TravelMode.TRANSIT,),
+            True,
+            1.0,
+            (),
+            10 * 60,
+            14 * 60,
+            date(2026, 11, 2),
+            date(2026, 11, 6),
+        ),
+    )
+
+    @property
+    def all_scheduled_obstructions(self) -> tuple[Obstruction, ...]:
+        """Return recurring and calendar-dated service disruptions."""
+        return (*self.SCHEDULED_OBSTRUCTIONS, *self.ANNUAL_MAINTENANCE)
 
     def __init__(self) -> None:
         """Create the locations, pathways, and bidirectional adjacency list."""
@@ -405,11 +559,19 @@ class CityMap:
         mode: Optional[TravelMode] = None,
         obstructions: tuple[Obstruction, ...] = (),
         board_train: bool = True,
+        weather_condition: Optional[str] = None,
     ) -> Leg:
         """Calculate an edge's travel and waiting time at the supplied instant."""
         speed_factor = 1.0
+        weather_risk = (
+            evaluate_weather_risk(edge, weather_condition)
+            if weather_condition is not None
+            else None
+        )
+        if weather_risk and weather_risk.level == "moderate":
+            speed_factor *= weather_risk.speed_factor
         if mode is not None:
-            for obstruction in (*self.SCHEDULED_OBSTRUCTIONS, *obstructions):
+            for obstruction in (*self.all_scheduled_obstructions, *obstructions):
                 if obstruction.is_active(edge, at, mode) and not obstruction.blocked:
                     speed_factor *= obstruction.speed_factor
         if edge.pathway is Pathway.TRAIN:
@@ -458,6 +620,8 @@ class CityMap:
         preferences: Preferences = Preferences(),
         limit: int = 3,
         obstructions: tuple[Obstruction, ...] = (),
+        weather_override: str = "auto",
+        consider_weather: bool = False,
     ) -> list[Route]:
         """Find up to ``limit`` distinct, simple routes ordered by user priority."""
         if start not in self.locations or destination not in self.locations:
@@ -502,8 +666,12 @@ class CityMap:
                 if any(
                     obstruction.is_active(edge, current_time, mode)
                     and obstruction.blocked
-                    for obstruction in (*self.SCHEDULED_OBSTRUCTIONS, *obstructions)
+                    for obstruction in (*self.all_scheduled_obstructions, *obstructions)
                 ):
+                    continue
+                condition = simulate_weather(current_time, weather_override).condition
+                risk = evaluate_weather_risk(edge, condition)
+                if consider_weather and risk and risk.level == "high":
                     continue
                 board_train = (
                     edge.pathway is Pathway.TRAIN
@@ -514,7 +682,12 @@ class CityMap:
                     )
                 )
                 leg = self._leg_for(
-                    edge, current_time, mode, obstructions, board_train
+                    edge,
+                    current_time,
+                    mode,
+                    obstructions,
+                    board_train,
+                    condition if consider_weather else None,
                 )
                 updated_legs = legs + (leg,)
                 updated_path = path + (edge.end,)
@@ -547,6 +720,8 @@ class CityMap:
         preferences: Preferences,
         limit: int = 3,
         obstructions: tuple[Obstruction, ...] = (),
+        weather_override: str = "auto",
+        consider_weather: bool = False,
     ) -> list[Route]:
         """Find route templates and estimate each one's latest feasible departure.
 
@@ -563,6 +738,8 @@ class CityMap:
             preferences,
             limit=max(limit * 4, limit),
             obstructions=obstructions,
+            weather_override=weather_override,
+            consider_weather=consider_weather,
         )
         feasible: list[Route] = []
         for candidate in candidates:
@@ -578,6 +755,8 @@ class CityMap:
                     mode,
                     preferences,
                     obstructions,
+                    weather_override,
+                    consider_weather,
                 )
                 if route is not None and route.arrival <= deadline:
                     best = route
@@ -600,6 +779,8 @@ class CityMap:
         mode: TravelMode,
         preferences: Preferences,
         obstructions: tuple[Obstruction, ...] = (),
+        weather_override: str = "auto",
+        consider_weather: bool = False,
     ) -> Optional[Route]:
         """Re-time a known sequence of locations and reject now-invalid links."""
         timed_legs: list[Leg] = []
@@ -620,9 +801,13 @@ class CityMap:
                 or any(
                     obstruction.is_active(edge, current_time, mode)
                     and obstruction.blocked
-                    for obstruction in (*self.SCHEDULED_OBSTRUCTIONS, *obstructions)
+                    for obstruction in (*self.all_scheduled_obstructions, *obstructions)
                 )
             ):
+                return None
+            condition = simulate_weather(current_time, weather_override).condition
+            risk = evaluate_weather_risk(edge, condition)
+            if consider_weather and risk and risk.level == "high":
                 return None
             board_train = (
                 edge.pathway is Pathway.TRAIN
@@ -633,7 +818,12 @@ class CityMap:
                 )
             )
             leg = self._leg_for(
-                edge, current_time, mode, obstructions, board_train
+                edge,
+                current_time,
+                mode,
+                obstructions,
+                board_train,
+                condition if consider_weather else None,
             )
             timed_legs.append(leg)
             current_time = leg.arrival
@@ -797,6 +987,8 @@ class TripRequest(BaseModel):
     avoid_tolls: bool = False
     avoid_highways: bool = False
     priority: Literal["fastest", "shortest"] = "fastest"
+    weather_override: Literal["auto", "sun", "rain", "wind", "storm", "snow"] = "auto"
+    consider_weather: bool = False
     limit: int = Field(default=3, ge=1, le=3)
 
 
@@ -833,6 +1025,8 @@ class RerouteRequest(BaseModel):
     avoid_tolls: bool = False
     avoid_highways: bool = False
     priority: Literal["fastest", "shortest"] = "fastest"
+    weather_override: Literal["auto", "sun", "rain", "wind", "storm", "snow"] = "auto"
+    consider_weather: bool = False
 
 
 class LocationResponse(BaseModel):
@@ -888,6 +1082,29 @@ class ScheduledObstructionResponse(BaseModel):
     weekdays: list[int]
     start_minute: int
     end_minute: int
+    starts_on: Optional[date] = None
+    ends_on: Optional[date] = None
+
+
+class WeatherRiskResponse(BaseModel):
+    """A predicted, not confirmed, weather impact on one pathway."""
+
+    start: str
+    end: str
+    pathway: str
+    name: str
+    level: Literal["moderate", "high"]
+    reason: str
+
+
+class WeatherResponse(BaseModel):
+    """Trip-time forecast and every pathway with a predicted weather risk."""
+
+    time: datetime
+    condition: str
+    label: str
+    description: str
+    risk_edges: list[WeatherRiskResponse]
 
 
 class RouteLegResponse(BaseModel):
@@ -994,8 +1211,10 @@ def get_city() -> CityResponse:
             weekdays=list(obstruction.weekdays),
             start_minute=obstruction.start_minute,
             end_minute=obstruction.end_minute,
+            starts_on=obstruction.starts_on,
+            ends_on=obstruction.ends_on,
         )
-        for obstruction in city.SCHEDULED_OBSTRUCTIONS
+        for obstruction in city.all_scheduled_obstructions
     ]
     manual_states = [
         ManualObstructionResponse(
@@ -1012,6 +1231,101 @@ def get_city() -> CityResponse:
         obstructions=obstructions,
         manual_obstructions=manual_states,
     )
+
+
+@app.get("/api/weather", response_model=WeatherResponse)
+def get_weather(
+    time: datetime,
+    weather_override: Literal["auto", "sun", "rain", "wind", "storm", "snow"] = "auto",
+) -> WeatherResponse:
+    """Return date-driven weather and its map-ready pathway risk layer."""
+    forecast = simulate_weather(time, weather_override)
+    risks: list[WeatherRiskResponse] = []
+    seen: set[tuple[str, str, str, str]] = set()
+    for edges in city.adjacency.values():
+        for edge in edges:
+            key = (
+                *sorted((edge.start, edge.end)),
+                edge.pathway.value,
+                edge.name,
+            )
+            if key in seen:
+                continue
+            seen.add(key)
+            risk = evaluate_weather_risk(edge, forecast.condition)
+            if risk is None:
+                continue
+            risks.append(
+                WeatherRiskResponse(
+                    start=edge.start,
+                    end=edge.end,
+                    pathway=edge.pathway.value,
+                    name=edge.name,
+                    level=risk.level,
+                    reason=risk.reason,
+                )
+            )
+    return WeatherResponse(
+        time=time,
+        condition=forecast.condition,
+        label=forecast.label,
+        description=forecast.description,
+        risk_edges=risks,
+    )
+
+
+@app.get("/api/schedule")
+def get_schedule() -> dict[str, list[dict[str, str | int]]]:
+    """Serve the page's schedule reference from the simulator's service rules."""
+    annual_maintenance = [
+        {
+            "service": obstruction.pathway.value.title(),
+            "pathway": obstruction.name,
+            "start": obstruction.start,
+            "end": obstruction.end,
+            "starts_on": obstruction.starts_on.isoformat(),
+            "ends_on": obstruction.ends_on.isoformat(),
+            "window": (
+                f"{obstruction.start_minute // 60:02d}:"
+                f"{obstruction.start_minute % 60:02d}-"
+                f"{obstruction.end_minute // 60:02d}:"
+                f"{obstruction.end_minute % 60:02d}"
+            ),
+            "reason": obstruction.reason,
+        }
+        for obstruction in city.ANNUAL_MAINTENANCE
+    ]
+    return {
+        "weekly_public_transport": [
+            {
+                "service": "Central Line train",
+                "operating_hours": "Daily, 06:00-22:45",
+                "peak_frequency": "Every 15 minutes",
+                "off_peak_frequency": "Every 15 minutes",
+            },
+            {
+                "service": "City bus network (reference timetable)",
+                "operating_hours": "Daily, 05:30-23:30",
+                "peak_frequency": "Every 10 minutes",
+                "off_peak_frequency": "Every 20 minutes",
+            },
+        ],
+        "weekly_traffic": [
+            {
+                "period": "Weekday morning rush",
+                "days": "Monday-Friday",
+                "window": "07:00-09:00",
+                "impact": "Road travel time is multiplied by 1.6",
+            },
+            {
+                "period": "Weekday evening rush",
+                "days": "Monday-Friday",
+                "window": "16:00-18:00",
+                "impact": "Road travel time is multiplied by 1.6",
+            },
+        ],
+        "annual_maintenance": annual_maintenance,
+    }
 
 
 def _manual_obstruction_key(
@@ -1067,6 +1381,8 @@ def _route_explanation(
     route_rank: int,
     route_count: int,
     obstructions: tuple[Obstruction, ...],
+    weather_override: str = "auto",
+    consider_weather: bool = False,
 ) -> str:
     """Explain a route using its traversed edges and the trip's active conditions."""
     route_edges = {
@@ -1097,7 +1413,7 @@ def _route_explanation(
             obstruction.is_active(edge, at, mode) for at in relevant_times
         ):
             continue
-        if obstruction not in city.SCHEDULED_OBSTRUCTIONS:
+        if obstruction not in city.all_scheduled_obstructions:
             condition = "user-placed blockage" if obstruction.blocked else "user-placed delay"
             reasons.append(f"It avoids a {condition} on {obstruction.name}.")
         else:
@@ -1105,6 +1421,64 @@ def _route_explanation(
                 f"It bypasses the scheduled {obstruction.reason.lower()} on {obstruction.name}."
             )
         break
+
+    weather_times = (route.departure, *(leg.departure for leg in route.legs))
+    weather_conditions = {
+        simulate_weather(at, weather_override).condition for at in weather_times
+    }
+    if not consider_weather:
+        has_forecast_risk = any(
+            evaluate_weather_risk(edge, condition)
+            for edges in city.adjacency.values()
+            for edge in edges
+            for condition in weather_conditions
+        )
+        if has_forecast_risk:
+            reasons.append(
+                "Predicted weather risks were ignored because weather-aware routing is off."
+            )
+    else:
+        route_pathways = {
+            (frozenset((leg.edge.start, leg.edge.end)), leg.edge.pathway)
+            for leg in route.legs
+        }
+        route_locations = set(route.locations)
+        weather_reason = None
+        for edges in city.adjacency.values():
+            for edge in edges:
+                edge_key = (frozenset((edge.start, edge.end)), edge.pathway)
+                if edge_key in route_pathways or not {
+                    edge.start,
+                    edge.end,
+                }.issubset(route_locations):
+                    continue
+                if any(
+                    (risk := evaluate_weather_risk(edge, condition)) is not None
+                    and risk.level == "high"
+                    for condition in weather_conditions
+                ):
+                    weather_reason = (
+                        f"It avoids a predicted weather obstruction on {edge.name}."
+                    )
+                    break
+            if weather_reason:
+                break
+        if weather_reason is None:
+            for leg in route.legs:
+                condition = simulate_weather(
+                    leg.departure, weather_override
+                ).condition
+                risk = evaluate_weather_risk(leg.edge, condition)
+                if risk and risk.level == "moderate":
+                    label = simulate_weather(
+                        leg.departure, weather_override
+                    ).label.lower()
+                    weather_reason = (
+                        f"It allows extra time for forecast {label} on {leg.edge.name}."
+                    )
+                    break
+        if weather_reason:
+            reasons.append(weather_reason)
 
     if preferences.avoid_tolls and mode is TravelMode.DRIVING:
         reasons.append("It honors your preference to avoid toll roads.")
@@ -1191,6 +1565,8 @@ def calculate_routes(request: TripRequest) -> RoutesResponse:
             preferences,
             limit=request.limit,
             obstructions=tuple(manual_obstructions.values()),
+            weather_override=request.weather_override,
+            consider_weather=request.consider_weather,
         )
     else:
         routes = city.find_routes(
@@ -1201,6 +1577,8 @@ def calculate_routes(request: TripRequest) -> RoutesResponse:
             preferences,
             limit=request.limit,
             obstructions=tuple(manual_obstructions.values()),
+            weather_override=request.weather_override,
+            consider_weather=request.consider_weather,
         )
     if not routes:
         raise HTTPException(
@@ -1212,7 +1590,7 @@ def calculate_routes(request: TripRequest) -> RoutesResponse:
     # identify and highlight the matching lines without another server request.
     active_obstructions = (
         *manual_obstructions.values(),
-        *city.SCHEDULED_OBSTRUCTIONS,
+        *city.all_scheduled_obstructions,
     )
     explanation_route_count = len(routes) if request.limit > 1 else 2
     return RoutesResponse(
@@ -1227,6 +1605,8 @@ def calculate_routes(request: TripRequest) -> RoutesResponse:
                     index,
                     explanation_route_count,
                     active_obstructions,
+                    request.weather_override,
+                    request.consider_weather,
                 ),
             )
             for index, route in enumerate(routes, start=1)
@@ -1347,7 +1727,17 @@ def calculate_reroute(request: RerouteRequest) -> RerouteResponse:
             # Transit follows its current fixed edge; cars also account for the
             # live road-speed conditions before their fixed-node transition.
             if mode is TravelMode.DRIVING:
-                current_leg = city._leg_for(edge, request.time, mode, tuple(obstructions))
+                current_leg = city._leg_for(
+                    edge,
+                    request.time,
+                    mode,
+                    tuple(obstructions),
+                    weather_condition=(
+                        simulate_weather(request.time, request.weather_override).condition
+                        if request.consider_weather
+                        else None
+                    ),
+                )
                 edge_minutes = (
                     current_leg.arrival - current_leg.departure
                 ).total_seconds() / 60
@@ -1376,6 +1766,8 @@ def calculate_reroute(request: RerouteRequest) -> RerouteResponse:
             preferences,
             limit=1,
             obstructions=tuple(obstructions),
+            weather_override=request.weather_override,
+            consider_weather=request.consider_weather,
         )
         if routes:
             candidates.append((routes[0], switch_node, approach_minutes))
@@ -1406,7 +1798,9 @@ def calculate_reroute(request: RerouteRequest) -> RerouteResponse:
                 preferences,
                 1,
                 2,
-                (*obstructions, *city.SCHEDULED_OBSTRUCTIONS),
+                (*obstructions, *city.all_scheduled_obstructions),
+                request.weather_override,
+                request.consider_weather,
             ),
         ),
     )

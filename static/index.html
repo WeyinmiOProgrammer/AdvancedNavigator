@@ -64,6 +64,22 @@
           </div>
         </div>
 
+        <p id="weather-forecast" class="weather-forecast" role="status" aria-live="polite">
+          Select a trip date and time to see the simulated forecast.
+        </p>
+
+        <fieldset class="preference-fields weather-preference">
+          <legend>Factor potential weather delays &amp; obstructions into route calculation?</legend>
+          <label class="check-control" for="weather-aware-yes">
+            <input id="weather-aware-yes" name="consider_weather" type="radio" value="yes" checked>
+            <span>Yes</span>
+          </label>
+          <label class="check-control" for="weather-aware-no">
+            <input id="weather-aware-no" name="consider_weather" type="radio" value="no">
+            <span>No</span>
+          </label>
+        </fieldset>
+
         <fieldset class="preference-fields">
           <legend>Optional road preferences</legend>
           <label class="check-control" for="avoid-tolls">
@@ -94,6 +110,8 @@
           <li><span class="legend-line selected" aria-hidden="true"></span>Selected route</li>
           <li><span class="legend-line delayed" aria-hidden="true"></span>Delayed pathway</li>
           <li><span class="legend-line blocked" aria-hidden="true"></span>Blocked pathway</li>
+          <li><span class="legend-risk moderate" aria-hidden="true"></span>Predicted weather delay</li>
+          <li><span class="legend-risk high" aria-hidden="true"></span>Predicted obstruction risk</li>
           <li><span class="legend-warning delayed" aria-hidden="true">!</span>Delay warning</li>
           <li><span class="legend-warning blocked" aria-hidden="true">×</span>Blockage warning</li>
         </ul>
@@ -110,7 +128,14 @@
              aria-label="Map of city locations and roads, pavements, and train lines">
           <title>City pathway map</title>
           <desc>Choose a route to highlight its path between locations.</desc>
+          <defs>
+            <filter id="weather-risk-glow" x="-60%" y="-60%" width="220%" height="220%">
+              <feGaussianBlur stdDeviation="4"></feGaussianBlur>
+            </filter>
+          </defs>
           <g id="map-viewport">
+            <!-- Weather-risk halos stay beneath the complete map network. -->
+            <g id="weather-risks" aria-label="Predicted weather risk pathways"></g>
             <g id="pathways"></g>
             <g id="selected-route"></g>
             <g id="map-locations"></g>
@@ -152,6 +177,17 @@
           <label for="incident-pathway">Specific pathway</label>
           <select id="incident-pathway"></select>
         </div>
+        <div class="field">
+          <label for="weather-override">Override Weather</label>
+          <select id="weather-override">
+            <option value="auto">Auto by Date</option>
+            <option value="sun">Clear/Sun</option>
+            <option value="rain">Rain</option>
+            <option value="wind">Wind</option>
+            <option value="storm">Storm</option>
+            <option value="snow">Snow</option>
+          </select>
+        </div>
         <button id="cycle-pathway-state" type="button">Cycle pathway state</button>
         <button id="trigger-blockage" type="button" disabled>Trigger Blockage</button>
         <button id="trigger-delay" type="button" disabled>Trigger Delay</button>
@@ -163,6 +199,12 @@
       <h2 id="routes-heading">Route options</h2>
       <p id="route-hint">Your available routes will appear here.</p>
       <div id="route-list" class="route-list"></div>
+    </section>
+
+    <section id="schedule-reference" class="schedule-section" aria-labelledby="schedule-heading">
+      <h2 id="schedule-heading">Simulation Schedule &amp; Disruption Reference</h2>
+      <p>Reference timings and planned maintenance used by the simulator.</p>
+      <div id="schedule-content" aria-live="polite">Loading simulation schedule…</div>
     </section>
   </main>
   <footer class="page-width">

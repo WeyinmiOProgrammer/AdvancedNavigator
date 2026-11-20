@@ -6,6 +6,7 @@ const datalist = document.querySelector("#location-options");
 const svg = document.querySelector("#city-map");
 const mapFrame = document.querySelector(".map-frame");
 const mapViewport = document.querySelector("#map-viewport");
+const weatherRisksGroup = document.querySelector("#weather-risks");
 const pathwaysGroup = document.querySelector("#pathways");
 const obstructionsGroup = document.querySelector("#map-obstructions");
 const selectedRouteGroup = document.querySelector("#selected-route");
@@ -26,6 +27,9 @@ const blockageButton = document.querySelector("#trigger-blockage");
 const delayButton = document.querySelector("#trigger-delay");
 const cyclePathwayButton = document.querySelector("#cycle-pathway-state");
 const edgeStateLive = document.querySelector("#edge-state-live");
+const weatherForecastReadout = document.querySelector("#weather-forecast");
+const weatherOverrideSelect = document.querySelector("#weather-override");
+const scheduleContent = document.querySelector("#schedule-content");
 
 let cityGraph;
 let selectedRoute = null;
@@ -50,6 +54,7 @@ let mapTranslateY = 0;
 let mapPointer = null;
 let suppressMapClick = false;
 let activeExplanation = null;
+let weatherRequestGeneration = 0;
 submitButton.disabled = true;
 startSimulationButton.disabled = true;
 
@@ -272,6 +277,54 @@ function renderCity(graph) {
     pathwayKey(pathway.start, pathway.end, pathway.pathway),
   ));
   refreshObstructionIcons();
+}
+
+// Forecast and risk-map updates use one response so the visible conditions and
+// the prediction halos always describe the same simulated weather state.
+async function refreshWeatherForecast() {
+  if (!cityGraph || !form.elements.time.value) return;
+  const generation = ++weatherRequestGeneration;
+  const params = new URLSearchParams({
+    time: form.elements.time.value,
+    weather_override: weatherOverrideSelect.value,
+  });
+  try {
+    const response = await fetch(`/api/weather?${params}`);
+    const result = await response.json();
+    if (!response.ok) {
+      throw new Error(result.detail || "The weather forecast could not be loaded.");
+    }
+    if (generation !== weatherRequestGeneration) return;
+    const highRiskCount = result.risk_edges.filter((item) => item.level === "high").length;
+    const moderateRiskCount = result.risk_edges.length - highRiskCount;
+    weatherForecastReadout.textContent = `${result.label} — ${result.description} `
+      + `Predicted risk: ${highRiskCount} high, ${moderateRiskCount} moderate pathway(s).`;
+    const lines = result.risk_edges.map((risk) => {
+      const pathway = pathwayByKey.get(pathwayKey(risk.start, risk.end, risk.pathway));
+      if (!pathway) return null;
+      const start = mapPoint(cityGraph.locations.find((item) => item.name === risk.start));
+      const end = mapPoint(cityGraph.locations.find((item) => item.name === risk.end));
+      const points = pathwayPoints(start, end, risk.pathway);
+      const halo = svgElement("line", {
+        x1: points.start.x,
+        y1: points.start.y,
+        x2: points.end.x,
+        y2: points.end.y,
+        class: `weather-risk-halo ${risk.level}`,
+        "aria-label": `Predicted ${risk.level} weather risk: ${risk.reason}`,
+      });
+      const title = svgElement("title");
+      title.textContent = `Predicted ${risk.level} risk — ${risk.name}: ${risk.reason}`;
+      halo.append(title);
+      return halo;
+    }).filter(Boolean);
+    // This group is the first visual group in the map viewport, below every network layer.
+    weatherRisksGroup.replaceChildren(...lines);
+  } catch (error) {
+    if (generation !== weatherRequestGeneration) return;
+    weatherForecastReadout.textContent = "The simulated forecast is unavailable.";
+    showError(error instanceof Error ? error.message : "The weather forecast could not be loaded.");
+  }
 }
 
 // Convert the internal state value into wording used by controls and announcements.
@@ -513,7 +566,10 @@ function activeScheduledObstructions(route) {
       const date = new Date(value);
       const weekday = (date.getDay() + 6) % 7;
       const minute = date.getHours() * 60 + date.getMinutes();
-      return (!item.weekdays.length || item.weekdays.includes(weekday))
+      const dateKey = `${date.getFullYear()}-${String(date.getMonth() + 1).padStart(2, "0")}-${String(date.getDate()).padStart(2, "0")}`;
+      return (!item.starts_on || dateKey >= item.starts_on)
+        && (!item.ends_on || dateKey <= item.ends_on)
+        && (!item.weekdays.length || item.weekdays.includes(weekday))
         && item.start_minute <= minute && minute < item.end_minute;
     };
     return matchesAt(tripDate)
@@ -813,6 +869,8 @@ async function triggerIncident(kind, randomAhead = false, chosenPathway = null, 
     avoid_tolls: data.has("avoid_tolls"),
     avoid_highways: data.has("avoid_highways"),
     priority: data.get("priority"),
+    weather_override: weatherOverrideSelect.value,
+    consider_weather: data.get("consider_weather") === "yes",
   };
   try {
     const response = await fetch("/api/reroute", {
@@ -905,6 +963,8 @@ function routeRequestPayload() {
     priority: data.get("priority"),
     avoid_tolls: data.has("avoid_tolls"),
     avoid_highways: data.has("avoid_highways"),
+    weather_override: weatherOverrideSelect.value,
+    consider_weather: data.get("consider_weather") === "yes",
   };
 }
 
@@ -974,11 +1034,100 @@ function clearRouteResults(message) {
   showError(message);
 }
 
+// Build schedule tables from API records instead of duplicating service data in the page.
+function appendScheduleTable(title, records, columns) {
+  const section = document.createElement("section");
+  section.className = "schedule-group";
+  const heading = document.createElement("h3");
+  heading.textContent = title;
+  section.append(heading);
+  const scroll = document.createElement("div");
+  scroll.className = "table-scroll";
+  const table = document.createElement("table");
+  table.className = "schedule-table";
+  table.setAttribute("aria-label", title);
+  const head = document.createElement("thead");
+  const headerRow = document.createElement("tr");
+  columns.forEach(([key, label]) => {
+    const cell = document.createElement("th");
+    cell.scope = "col";
+    cell.textContent = label;
+    headerRow.append(cell);
+  });
+  head.append(headerRow);
+  const body = document.createElement("tbody");
+  records.forEach((record) => {
+    const row = document.createElement("tr");
+    columns.forEach(([key]) => {
+      const cell = document.createElement("td");
+      cell.textContent = String(record[key] ?? "—");
+      row.append(cell);
+    });
+    body.append(row);
+  });
+  table.append(head, body);
+  scroll.append(table);
+  section.append(scroll);
+  scheduleContent.append(section);
+}
+
+// Keep the footer reference synchronized with the backend route and disruption rules.
+async function loadSchedule() {
+  try {
+    const response = await fetch("/api/schedule");
+    const schedule = await response.json();
+    if (!response.ok) {
+      throw new Error(schedule.detail || "The simulation schedule could not be loaded.");
+    }
+    scheduleContent.replaceChildren();
+    appendScheduleTable("Weekly Public Transport Timetables", schedule.weekly_public_transport, [
+      ["service", "Service"],
+      ["operating_hours", "Operating hours"],
+      ["peak_frequency", "Peak frequency"],
+      ["off_peak_frequency", "Off-peak interval"],
+    ]);
+    appendScheduleTable("Recurring Weekly Traffic Patterns", schedule.weekly_traffic, [
+      ["period", "Pattern"],
+      ["days", "Days"],
+      ["window", "Time window"],
+      ["impact", "Routing impact"],
+    ]);
+    appendScheduleTable("Annual Scheduled Construction & Outages", schedule.annual_maintenance, [
+      ["service", "Service type"],
+      ["pathway", "Pathway"],
+      ["start", "From"],
+      ["end", "To"],
+      ["starts_on", "Starts"],
+      ["ends_on", "Ends"],
+      ["window", "Daily window"],
+      ["reason", "Disruption"],
+    ]);
+    const note = document.createElement("p");
+    note.className = "schedule-note";
+    note.textContent = "The bus timetable is reference-only; the current route graph models road, walking, and train pathways.";
+    scheduleContent.append(note);
+  } catch (error) {
+    scheduleContent.textContent = "The simulation schedule could not be loaded.";
+    showError(error instanceof Error ? error.message : "The simulation schedule could not be loaded.");
+  }
+}
+
 // Keep the label synchronized with the selected departure/arrival constraint.
 timeKind.addEventListener("change", () => {
   timeLabel.textContent = timeKind.value === "arrival"
     ? "Arrival date and time"
     : "Departure date and time";
+});
+form.elements.time.addEventListener("change", () => {
+  refreshWeatherForecast();
+  scheduleAutomaticRouteRefresh();
+});
+weatherOverrideSelect.addEventListener("change", () => {
+  refreshWeatherForecast();
+  scheduleAutomaticRouteRefresh();
+});
+form.querySelectorAll('input[name="consider_weather"]').forEach((input) => {
+  input.addEventListener("change", () => scheduleAutomaticRouteRefresh());
 });
 
 // Run a user-requested search, clearing the old choice before displaying results.
@@ -1078,6 +1227,7 @@ async function loadCity() {
     renderCity(await response.json());
     submitButton.disabled = false;
     setTestingControls(false);
+    await refreshWeatherForecast();
   } catch (error) {
     showError(error instanceof Error ? error.message : "The city map could not be loaded.");
     submitButton.disabled = true;
@@ -1089,3 +1239,4 @@ const defaultTime = new Date();
 defaultTime.setMinutes(defaultTime.getMinutes() - defaultTime.getTimezoneOffset());
 form.elements.time.value = defaultTime.toISOString().slice(0, 16);
 loadCity();
+loadSchedule();

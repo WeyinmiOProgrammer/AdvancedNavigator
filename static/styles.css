@@ -19,7 +19,7 @@ body { margin: 0; min-width: 320px; }
 .site-header .eyebrow { color: #d3e4ff; font-size: .85rem; font-weight: 700; letter-spacing: .08em; text-transform: uppercase; }
 
 main { padding-block: 1.5rem 2rem; }
-.trip-panel, .map-section, .routes-section {
+.trip-panel, .map-section, .routes-section, .schedule-section {
   margin-bottom: 1.5rem;
   padding: clamp(1rem, 3vw, 1.5rem);
   border: 1px solid #cbd5e1;
@@ -30,6 +30,15 @@ main { padding-block: 1.5rem 2rem; }
 h2 { margin: 0 0 1rem; font-size: 1.35rem; }
 .location-fields, .settings-grid { display: grid; grid-template-columns: repeat(2, minmax(0, 1fr)); gap: 1rem; }
 .settings-grid { margin-top: 1rem; }
+.weather-forecast {
+  margin: 1rem 0 0;
+  padding: .8rem 1rem;
+  border-left: 4px solid #174ea6;
+  border-radius: .25rem;
+  background: #eef5ff;
+  line-height: 1.5;
+}
+.weather-preference { margin-top: 1rem; }
 .field { display: grid; gap: .4rem; }
 .field label, legend { font-weight: 700; }
 input, select, button { font: inherit; }
@@ -73,6 +82,9 @@ input, select, button { font: inherit; }
 .legend-line.selected { border-color: #b42318; border-top-width: 5px; }
 .legend-line.delayed { border-color: #e65100; border-top-width: 4px; border-top-style: dashed; }
 .legend-line.blocked { border-color: #c00050; border-top-width: 5px; border-top-style: dotted; }
+.legend-risk { display: inline-block; width: 1.35rem; height: .75rem; border-radius: 50%; filter: blur(2px); }
+.legend-risk.moderate { background: rgb(230 81 0 / 55%); }
+.legend-risk.high { background: rgb(192 0 80 / 55%); }
 .legend-warning { display: inline-grid; width: 1.15rem; height: 1.15rem; place-items: center; border: 2px solid; border-radius: 50%; font-size: .8rem; font-weight: 800; }
 .legend-warning.delayed { border-color: #b54708; color: #7a2e0e; background: #fff0c2; }
 .legend-warning.blocked { border-color: #a00050; border-style: dashed; color: #79003d; background: #ffe4ef; }
@@ -111,6 +123,9 @@ input, select, button { font: inherit; }
 .pathway-blocked { stroke: #c00050; stroke-width: 5; stroke-dasharray: 3 4; }
 .pathway-hit-area { fill: none; stroke: transparent; stroke-width: 12; pointer-events: stroke; cursor: pointer; }
 .pathway-hit-area:focus-visible { stroke: rgb(245 158 11 / 35%); outline: none; }
+.weather-risk-halo { fill: none; stroke-linecap: round; stroke-width: 13; opacity: .48; filter: url(#weather-risk-glow); pointer-events: none; }
+.weather-risk-halo.moderate { stroke: #e65100; }
+.weather-risk-halo.high { stroke: #c00050; }
 /* Warning markers use separate high-contrast shapes so routes stay distinguishable. */
 .obstruction-marker { fill: #fff0c2; stroke: #b54708; stroke-width: 2.5; pointer-events: none; }
 .obstruction-marker.obstruction-blocked { fill: #ffe4ef; stroke: #a00050; stroke-dasharray: 3 2; }
@@ -200,6 +215,15 @@ input, select, button { font: inherit; }
   border-radius: .75rem;
   background: #fff;
 }
+.schedule-section > p { margin-top: -.5rem; color: #475569; }
+.schedule-group { margin-top: 1.5rem; }
+.schedule-group h3 { margin: 0 0 .6rem; font-size: 1.05rem; }
+.table-scroll { overflow-x: auto; border: 1px solid #cbd5e1; border-radius: .4rem; }
+.schedule-table { width: 100%; border-collapse: collapse; text-align: left; }
+.schedule-table th, .schedule-table td { min-width: 8rem; padding: .65rem .75rem; border-bottom: 1px solid #dbe2ea; vertical-align: top; }
+.schedule-table th { color: #12305a; background: #eef5ff; }
+.schedule-table tr:last-child td { border-bottom: 0; }
+.schedule-note { color: #475569; font-size: .9rem; }
 .playback-controls, .testing-controls { display: flex; flex-wrap: wrap; align-items: end; gap: .75rem; }
 .playback-controls button, .testing-controls button, .playback-controls select, .testing-controls select {
   min-height: 2.8rem;
@@ -221,4 +245,5 @@ footer { padding-bottom: 1rem; color: #475569; font-size: .9rem; }
   .location-fields, .settings-grid { grid-template-columns: 1fr; }
   .section-heading { flex-direction: column; }
   .preference-fields { flex-direction: column; }
+  .schedule-table th, .schedule-table td { padding: .55rem; }
 }
